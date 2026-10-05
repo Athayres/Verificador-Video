@@ -1,0 +1,9 @@
+{
+  "name": "verificador-video-real",
+  "version": "6.2.0",
+  "description": "Addon Stremio que marca streams com conteúdo incorreto",
+  "main": "verificador.js",
+  "scripts": { "start": "node verificador.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "cors": "^2.8.5", "express": "^4.21.2" }
+}
