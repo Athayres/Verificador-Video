@@ -1,0 +1,8 @@
+{
+  "name": "verificador-stremio-worker",
+  "version": "6.2.0",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
