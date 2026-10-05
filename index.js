@@ -1,6 +1,8 @@
 const SELF_ID = 'org.verificador.stream';
 const CINEMETA = 'https://v3-cinemeta.strem.io';
 const STREMIO_API = 'https://api.strem.io/api';
+const LOGO_URL = 'https://raw.githubusercontent.com/Athayres/Verificador-Video/refs/heads/main/check_tempo.jpg';
+
 const CACHE_MS = 5 * 60 * 1000;
 const STREAM_TIMEOUT = 8000;
 const STREAM_CACHE_MS = 2 * 60 * 1000;
@@ -30,7 +32,8 @@ const manifest = {
     catalogs: [],
     resources: ['stream'],
     idPrefixes: ['tt'],
-    behaviorHints: { configurable: true }
+    behaviorHints: { configurable: true },
+    logo: LOGO_URL
 };
 
 // ---------- Utilitários ----------
@@ -178,7 +181,7 @@ function marcar(stream, addonNome, incorreto) {
     if (incorreto) {
         const detalhe = stream.title || stream.description || stream.filename || 'Sem detalhes';
         if (stream.description !== undefined) r.description = `⚠️ [CONTEÚDO INCORRETO] ${stream.description}`;
-        if (stream.title !== undefined || stream.description === undefined) r.title = `⚠️ [CONTEÚDO INCORRETO] ${stream.title || detalhe}`;
+        if (stream.title !== undefined || stream.description === undefined) r.title = `⚠️️ [CONTEÚDO INCORRETO] ${stream.title || detalhe}`;
     }
     return r;
 }
@@ -202,6 +205,7 @@ p { color: #aaa; font-size: 13px; }
 </head>
 <body>
 <div class="box">
+  <img src="/check_tempo.jpg" alt="Logo" style="width:72px;height:72px;display:block;margin:0 auto 8px" onerror="this.style.display='none'">
   <h2 style="text-align:center">Verificador de Streams</h2>
   <p>Entre com a sua conta do Stremio. O Verificador passa a usar automaticamente todos os addons com streams que você tiver instalados.</p>
   <input type="email" id="email" placeholder="E-mail do Stremio">
@@ -271,20 +275,14 @@ export default {
             return renderConfigurePage(host, protocol);
         }
 
-        // 2. Manifesto (com ou sem config)
+        // 2. Manifesto
         if (path === '/manifest.json' || /^\/[^\/]+\/manifest\.json$/.test(path)) {
-            const manifestComLogo = {
-                ...manifest,
-                logo: `${protocol}://${host}/check_tempo.jpg`
-            };
-            return new Response(JSON.stringify(manifestComLogo), { headers: corsHeaders });
+            return new Response(JSON.stringify(manifest), { headers: corsHeaders });
         }
 
-        // 3. Logótipo (placeholder / ícone do relógio)
+        // 3. Logótipo redireciona direto para o raw do GitHub
         if (path === '/check_tempo.jpg') {
-            // Retorna um ícone SVG leve convertido em resposta de imagem
-            const svgLogo = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100" height="100"><circle cx="256" cy="256" r="240" fill="#00bcd4"/><path d="M160 260l70 70 130-130" fill="none" stroke="#fff" stroke-width="40" stroke-linecap="round"/></svg>`;
-            return new Response(svgLogo, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' } });
+            return Response.redirect(LOGO_URL, 302);
         }
 
         // 4. Streams
