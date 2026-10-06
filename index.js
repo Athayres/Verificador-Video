@@ -34,6 +34,8 @@ let KV = null;
 let TOL = 0.10;
 let TOL_MIN = 5;
 let TIMEOUT = 8000;
+let ORCAMENTO_MS = 8000;
+let MAX_SONDAS = 12;
 
 async function carregarConfig(env) {
   KV = env.KV || null;
@@ -50,6 +52,8 @@ async function carregarConfig(env) {
   TOL = Number(env.TOLERANCIA || 0.10);
   TOL_MIN = Number(env.TOLERANCIA_MIN || 5);
   TIMEOUT = Number(env.FFPROBE_TIMEOUT || 8000);
+  ORCAMENTO_MS = Number(env.VERIFICACAO_MS || 8000);
+  MAX_SONDAS = Number(env.MAX_SONDAS || 12);
 }
 
 // ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
@@ -332,14 +336,14 @@ async function duracaoArquivo(url) {
 }
 
 // 'ok' | 'errado' | 'nao_verificado'  (só "errado" impede o vídeo de abrir)
-async function veredito({ u, i, t }) {
+async function veredito({ u, i, t }, rtConhecido) {
   const chave = `${i}|${t}|${u}`;
   const c = await cLer('vered', chave);
   if (c) return c;
   if (!TMDB_KEY) return { status: 'nao_verificado' };
   let r;
   try {
-    const [rt, dur] = await Promise.all([runtimeMin(i, t), duracaoArquivo(u)]);
+    const [rt, dur] = await Promise.all([rtConhecido !== undefined ? rtConhecido : runtimeMin(i, t), duracaoArquivo(u)]);
     if (!rt || !dur) return { status: 'nao_verificado', tmdbMin: rt, arquivoMin: dur && Math.round(dur) };
     const folga = Math.max(rt * TOL, TOL_MIN);
     r = { status: Math.abs(dur - rt) <= folga ? 'ok' : 'errado', tmdbMin: rt, arquivoMin: Math.round(dur) };
@@ -413,6 +417,40 @@ async function listaDeOrigens(cfgB64, host, tipo, id) {
     .filter((a) => !vistos.has(a.u) && vistos.add(a.u))
     .slice(0, 30);
   return { lista: final, erro, temConta: !!cfg };
+}
+
+// ---------- conferência da lista (marca o título dos vídeos incorretos) ----------
+const ehDireto = (s) => !!s && typeof s.url === 'string' && /^https?:\/\//i.test(s.url) && !(s.behaviorHints && s.behaviorHints.proxyHeaders);
+
+// Confere os links diretos: primeiro o que já está em cache (grátis), depois mede alguns (até MAX_SONDAS, 4 por vez)
+// dentro de um tempo limite. O que não terminar a tempo continua sendo conferido em segundo plano e fica no cache.
+async function verificarLista(itens, id, tipo, rt, ctx, orcamento) {
+  const resultados = new Map();
+  const diretos = itens.filter((it) => ehDireto(it.s));
+  const emCache = await Promise.all(diretos.map((it) => cLer('vered', `${id}|${tipo}|${it.s.url}`)));
+  const pendentes = [];
+  diretos.forEach((it, k) => { if (emCache[k]) resultados.set(it, emCache[k]); else pendentes.push(it); });
+  const alvo = pendentes.slice(0, MAX_SONDAS);
+  let prox = 0;
+  const trabalhador = async () => {
+    while (prox < alvo.length) {
+      const it = alvo[prox++];
+      try { resultados.set(it, await veredito({ u: it.s.url, i: id, t: tipo }, rt)); } catch { /* segue */ }
+    }
+  };
+  const todos = Promise.all([0, 1, 2, 3].map(() => trabalhador()));
+  await Promise.race([todos, new Promise((ok) => setTimeout(ok, orcamento))]);
+  if (ctx && ctx.waitUntil) ctx.waitUntil(todos.catch(() => {}));
+  return { resultados, semTempo: Math.max(0, pendentes.length - MAX_SONDAS) };
+}
+
+function marcarIncorreto(s, v) {
+  const aviso = `⚠️ VÍDEO INCORRETO: o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min`;
+  const r = Object.assign({}, s, { name: `⚠️ INCORRETO | ${s.name || 'Stream'}` });
+  const resto = s.description || s.title || '';
+  r.description = resto ? `${aviso}\n${resto}` : aviso;
+  r.title = r.description;
+  return r;
 }
 
 // ---------- addons de origem ----------
@@ -521,7 +559,7 @@ async function entrar(){
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       if (request.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS' } });
@@ -561,10 +599,39 @@ export default {
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
         const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
         const listas = await Promise.all(origens.lista.map((a) => streamsDe(a.u, tipo, id)));
-        const todos = listas.flat();
-        const streams = TMDB_KEY && SECRET ? await Promise.all(todos.map((s) => reescrever(s, base, tipo, id))) : todos;
-        console.log(`stream ${tipo} ${id}: ${streams.length} streams (${streams.filter((s) => s && /\/play\//.test(s.url || '')).length} com conferência)`);
-        return json({ streams });
+        const itens = [];
+        origens.lista.forEach((a, k) => listas[k].forEach((s) => itens.push({ s, origem: a.n })));
+        const log = [];
+        let streams;
+        if (TMDB_KEY && SECRET) {
+          const t0 = Date.now();
+          const rt = await runtimeMin(id, tipo).catch(() => undefined);
+          let ver = { resultados: new Map(), semTempo: 0 };
+          if (rt) {
+            const orcamento = Math.max(2500, Math.min(ORCAMENTO_MS, 12000 - (Date.now() - t0)));
+            ver = await verificarLista(itens, id, tipo, rt, ctx, orcamento);
+          }
+          streams = await Promise.all(itens.map(async (it) => {
+            let s = await reescrever(it.s, base, tipo, id);
+            const v = ver.resultados.get(it);
+            const nome = String(it.s.name || it.s.title || 'Stream').replace(/\s+/g, ' ').slice(0, 60);
+            let situacao;
+            if (!ehDireto(it.s)) situacao = 'não é link direto (sem conferência)';
+            else if (!rt) situacao = 'TMDB sem duração (sem conferência)';
+            else if (!v) situacao = 'sem conferência (tempo ou limite de links)';
+            else if (v.status === 'nao_verificado') situacao = 'não deu para ler a duração do arquivo';
+            else situacao = `${v.status.toUpperCase()} (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)`;
+            log.push(`[${it.origem}] ${nome} -> ${situacao}`);
+            if (v && v.status === 'errado') s = marcarIncorreto(s, v);
+            return s;
+          }));
+          const incorretos = streams.filter((s) => /INCORRETO/.test(s.name || '')).length;
+          console.log(`stream ${tipo} ${id}: ${streams.length} streams, TMDB ${rt || '?'} min, ${incorretos} incorretos`);
+          for (const l of log) console.log('[verif]', id, l);
+        } else {
+          streams = itens.map((it) => it.s);
+        }
+        return json(url.searchParams.get('log') ? { streams, log } : { streams });
       }
 
       if (partes[0] === 'play') {

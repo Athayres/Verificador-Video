@@ -5,7 +5,11 @@ compatibility_date = "2026-01-01"
 # Mantém no deploy as variáveis/secrets cadastrados no painel
 keep_vars = true
 
-# Mesmo KV do outro projeto (guarda TMDB_KEY, UPSTREAM_URL e SECRET como entradas, e o cache de veredito).
+# Liga os logs do Worker (painel: Workers & Pages > verificador-videos > Observability / Logs)
+[observability]
+enabled = true
+
+# Mesmo KV do outro projeto (guarda TMDB_KEY e SECRET como entradas, e o cache de veredito).
 [[kv_namespaces]]
 binding = "KV"
 id = "1cd06a5363d1444fa7bcf08be3926a6f"
