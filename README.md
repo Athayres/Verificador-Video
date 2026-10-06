@@ -1,4 +1,4 @@
-autor Athayres Oliveira Miranda
+Autor: Athayres Oliveira Miranda
 
 ADD-ON Stremio esse add-on foi criado para suprir a necessidade de autenticar
 um vídeo se e o mesmo mostrado no catalogo devido a complexidade do stremio não é
