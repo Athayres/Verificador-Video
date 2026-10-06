@@ -11,7 +11,8 @@
  *
  * DIFERENÇA para o Render: o Worker não executa programas (não existe ffprobe). A duração é lida do
  * cabeçalho do arquivo por pedidos Range (MP4/MOV pelo átomo moov/mvhd; MKV/WebM pelo Info/Duration).
- * Formatos que não dê para ler (HLS .m3u8, TS, AVI, servidor sem Range...) tocam normalmente.
+ * HLS (.m3u8) também é medido (soma dos trechos). O que não dá para medir (torrent, TS, AVI, servidor sem Range...)
+ * é conferido só pelo NOME do arquivo (ano do filme e temporada/episódio) e, se nada indicar erro, toca normalmente.
  *
  * Os addons de origem NÃO são digitados: na página /configure você entra com a sua conta do Stremio, e o Worker
  * lê a lista de addons instalados na conta e usa só os que têm "stream" (ignora o próprio Verificador).
@@ -146,30 +147,39 @@ function partesDoId(id) {
   return { imdb, temporada: Number(t) > 0 ? Number(t) : null, episodio: Number(e) > 0 ? Number(e) : null };
 }
 
-async function runtimeMin(id, tipo) {
+async function infoTMDB(id, tipo) {
   const c = await cLer('runtime', id + '|' + tipo);
-  if (c !== undefined) return c;
+  if (c !== undefined) return c && typeof c === 'object' ? c : { min: c, ano: null, titulos: [] };
   const { imdb, temporada, episodio } = partesDoId(id);
   const f = await tmdb(`/find/${imdb}`, { external_source: 'imdb_id' });
   let min = null;
+  let ano = null;
+  let titulos = [];
   if (tipo === 'movie') {
     const m = (f.movie_results || [])[0];
-    if (m) min = (await tmdb(`/movie/${m.id}`)).runtime || null;
+    if (m) {
+      min = (await tmdb(`/movie/${m.id}`)).runtime || null;
+      ano = parseInt(String(m.release_date || '').slice(0, 4), 10) || null;
+      titulos = [m.title, m.original_title].filter(Boolean);
+    }
   } else {
-    const s = (f.tv_results || [])[0];
-    if (s) {
+    const sr = (f.tv_results || [])[0];
+    if (sr) {
+      titulos = [sr.name, sr.original_name].filter(Boolean);
       if (temporada && episodio) {
-        try { min = (await tmdb(`/tv/${s.id}/season/${temporada}/episode/${episodio}`)).runtime || null; } catch { /* usa o geral */ }
+        try { min = (await tmdb(`/tv/${sr.id}/season/${temporada}/episode/${episodio}`)).runtime || null; } catch { /* usa o geral */ }
       }
       if (!min) {
-        const d = await tmdb(`/tv/${s.id}`);
+        const d = await tmdb(`/tv/${sr.id}`);
         min = (d.episode_run_time && d.episode_run_time[0]) || (d.last_episode_to_air && d.last_episode_to_air.runtime) || null;
       }
     }
   }
-  await cGravar('runtime', id + '|' + tipo, min);
-  return min;
+  const info = { min, ano, titulos };
+  await cGravar('runtime', id + '|' + tipo, info);
+  return info;
 }
+async function runtimeMin(id, tipo) { return (await infoTMDB(id, tipo)).min; }
 
 // ---------- duração do arquivo (substitui o ffprobe): lê só o cabeçalho com pedidos Range ----------
 async function lerFaixa(url, ini, tam) {
@@ -315,6 +325,42 @@ function duracaoMKV(d) {
   return null;
 }
 
+async function lerTexto(url, max) {
+  const r = await fetch(url, { headers: { 'User-Agent': UA, Accept: '*/*' }, redirect: 'follow', signal: AbortSignal.timeout(TIMEOUT) });
+  if (!r.ok) { try { await r.body.cancel(); } catch {} return null; }
+  const leitor = r.body.getReader();
+  const partes = [];
+  let lidos = 0;
+  while (lidos < max) {
+    const { done, value } = await leitor.read();
+    if (done) break;
+    partes.push(value);
+    lidos += value.length;
+  }
+  try { await leitor.cancel(); } catch {}
+  const tudo = new Uint8Array(lidos);
+  let p = 0;
+  for (const v of partes) { tudo.set(v, p); p += v.length; }
+  return td.decode(tudo);
+}
+
+// HLS: soma a duração dos trechos (só playlist completa, com #EXT-X-ENDLIST); se for a lista mestre, usa a 1ª variante
+async function duracaoHLS(url) {
+  let texto = await lerTexto(url, 800000);
+  for (let n = 0; n < 2 && texto && texto.includes('#EXT-X-STREAM-INF'); n++) {
+    const linhas = texto.split(/\r?\n/);
+    const k = linhas.findIndex((l) => l.startsWith('#EXT-X-STREAM-INF'));
+    const uri = (linhas[k + 1] || '').trim();
+    if (!uri || uri.startsWith('#')) return null;
+    url = new URL(uri, url).href;
+    texto = await lerTexto(url, 800000);
+  }
+  if (!texto || !texto.includes('#EXT-X-ENDLIST')) return null;
+  let total = 0;
+  for (const m of texto.matchAll(/#EXTINF:([\d.]+)/g)) total += parseFloat(m[1]);
+  return total > 0 ? total : null;
+}
+
 // minutos, ou null se não deu para ler
 async function duracaoArquivo(url) {
   try {
@@ -322,7 +368,9 @@ async function duracaoArquivo(url) {
     if (!ini || !ini.dados || ini.dados.length < 12) return null;
     const d = ini.dados;
     let seg = null;
-    if (d[4] === 0x66 && d[5] === 0x74 && d[6] === 0x79 && d[7] === 0x70) { // 'ftyp' = MP4/MOV
+    if (d[0] === 0x23 && d[1] === 0x45 && d[2] === 0x58 && d[3] === 0x54 && d[4] === 0x4D && d[5] === 0x33 && d[6] === 0x55) { // '#EXTM3U' = HLS
+      seg = await duracaoHLS(url);
+    } else if (d[4] === 0x66 && d[5] === 0x74 && d[6] === 0x79 && d[7] === 0x70) { // 'ftyp' = MP4/MOV
       seg = await duracaoMP4(url, ini);
     } else if (d[0] === 0x1A && d[1] === 0x45 && d[2] === 0xDF && d[3] === 0xA3) { // EBML = MKV/WebM
       seg = duracaoMKV(d);
@@ -444,8 +492,52 @@ async function verificarLista(itens, id, tipo, rt, ctx, orcamento) {
   return { resultados, semTempo: Math.max(0, pendentes.length - MAX_SONDAS) };
 }
 
-function marcarIncorreto(s, v) {
-  const aviso = `⚠️ VÍDEO INCORRETO: o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min`;
+// ---------- conferência pelo NOME do arquivo (para o que não dá para medir) ----------
+const MARCA_RELEASE = /\b(bluray|blu-ray|bdrip|brrip|webrip|web-dl|webdl|hdtv|dvdrip|hdrip|x264|x265|h264|h265|hevc|remux)\b/i;
+
+function nomeDoArquivo(s) {
+  const bh = s.behaviorHints || {};
+  if (bh.filename) return String(bh.filename);
+  if (typeof s.url === 'string') {
+    try {
+      const f = decodeURIComponent(new URL(s.url).pathname.split('/').pop() || '');
+      if (/\.(mkv|mp4|avi|m4v|mov|webm|ts)$/i.test(f)) return f;
+    } catch {}
+  }
+  const t = String(s.title || s.description || '').split('\n')[0];
+  return MARCA_RELEASE.test(t) ? t : '';
+}
+
+const p2 = (n) => String(n).padStart(2, '0');
+const normalizar = (t) => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+
+// devolve o motivo (texto) se o NOME mostra claramente outro filme/episódio; senão null
+function checarNome(s, tipo, id, info) {
+  const nome = nomeDoArquivo(s);
+  if (!nome) return null;
+  if (tipo === 'series') {
+    const { temporada, episodio } = partesDoId(id);
+    if (!temporada || !episodio) return null;
+    const m = nome.match(/\bS(\d{1,2})[ ._-]?E(\d{1,3})(?:[ ._-]?(?:E|-E?)(\d{1,3}))?/i) || nome.match(/\b(\d{1,2})x(\d{2,3})\b/i);
+    if (!m) return null;
+    const s1 = Number(m[1]);
+    const e1 = Number(m[2]);
+    const e2 = m[3] ? Number(m[3]) : e1;
+    if (s1 !== temporada || episodio < e1 || episodio > e2) return `o arquivo parece ser S${p2(s1)}E${p2(e1)} e você abriu S${p2(temporada)}E${p2(episodio)}`;
+    return null;
+  }
+  if (!info || !info.ano) return null;
+  const titulosNum = normalizar((info.titulos || []).join(' '));
+  const anos = [];
+  for (const m of nome.matchAll(/(?<![\dx])(19|20)\d{2}(?![\dxp])/gi)) {
+    if (!titulosNum.includes(m[0])) anos.push(Number(m[0])); // ignora ano que faz parte do título (1917, 2012...)
+  }
+  if (anos.length && !anos.some((a) => Math.abs(a - info.ano) <= 1)) return `o arquivo parece ser de ${anos[0]} e o filme é de ${info.ano}`;
+  return null;
+}
+
+function marcarIncorreto(s, m) {
+  const aviso = `⚠️ VÍDEO INCORRETO (${m.por}): ${m.texto}`;
   const r = Object.assign({}, s, { name: `⚠️ INCORRETO | ${s.name || 'Stream'}` });
   const resto = s.description || s.title || '';
   r.description = resto ? `${aviso}\n${resto}` : aviso;
@@ -480,7 +572,7 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.2.0',
+    version: '1.3.0',
     name: 'Verificador de Duração',
     description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
     logo: `${base}/check_tempo.png`,
@@ -605,7 +697,8 @@ export default {
         let streams;
         if (TMDB_KEY && SECRET) {
           const t0 = Date.now();
-          const rt = await runtimeMin(id, tipo).catch(() => undefined);
+          const info = await infoTMDB(id, tipo).catch(() => undefined);
+          const rt = info ? info.min : undefined;
           let ver = { resultados: new Map(), semTempo: 0 };
           if (rt) {
             const orcamento = Math.max(2500, Math.min(ORCAMENTO_MS, 12000 - (Date.now() - t0)));
@@ -616,13 +709,20 @@ export default {
             const v = ver.resultados.get(it);
             const nome = String(it.s.name || it.s.title || 'Stream').replace(/\s+/g, ' ').slice(0, 60);
             let situacao;
-            if (!ehDireto(it.s)) situacao = 'não é link direto (sem conferência)';
-            else if (!rt) situacao = 'TMDB sem duração (sem conferência)';
-            else if (!v) situacao = 'sem conferência (tempo ou limite de links)';
+            if (!ehDireto(it.s)) situacao = 'não é link direto (duração não medida)';
+            else if (!rt) situacao = 'TMDB sem duração';
+            else if (!v) situacao = 'duração não medida (tempo ou limite de links)';
             else if (v.status === 'nao_verificado') situacao = 'não deu para ler a duração do arquivo';
             else situacao = `${v.status.toUpperCase()} (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)`;
+            let marca = null;
+            if (v && v.status === 'errado') marca = { por: 'duração', texto: `o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min` };
+            else if (!v || v.status === 'nao_verificado') { // duração indisponível: confere pelo nome do arquivo
+              const motivo = info ? checarNome(it.s, tipo, id, info) : null;
+              if (motivo) { marca = { por: 'nome do arquivo', texto: motivo }; situacao = `ERRADO pelo nome: ${motivo}`; }
+              else if (nomeDoArquivo(it.s)) situacao += ` | nome "${nomeDoArquivo(it.s).slice(0, 70)}" sem sinais de erro`;
+            }
             log.push(`[${it.origem}] ${nome} -> ${situacao}`);
-            if (v && v.status === 'errado') s = marcarIncorreto(s, v);
+            if (marca) s = marcarIncorreto(s, marca);
             return s;
           }));
           const incorretos = streams.filter((s) => /INCORRETO/.test(s.name || '')).length;
