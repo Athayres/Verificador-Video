@@ -38,6 +38,7 @@ let TIMEOUT = 8000;
 let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
 let OS_KEY = '';
+let BLOQUEAR = true;
 
 async function carregarConfig(env) {
   KV = env.KV || null;
@@ -57,6 +58,7 @@ async function carregarConfig(env) {
   ORCAMENTO_MS = Number(env.VERIFICACAO_MS || 8000);
   MAX_SONDAS = Number(env.MAX_SONDAS || 12);
   OS_KEY = await ler('OPENSUBTITLES_KEY');
+  BLOQUEAR = String(env.BLOQUEAR_INCORRETOS || '1') !== '0';
 }
 
 // ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
@@ -624,13 +626,24 @@ function checarNome(s, tipo, id, info) {
   return null;
 }
 
+const PREFIXO = 'Vídeo incorreto : ';
+
+// Troca o próprio nome do stream: "Batman A queda do morcego parte 2" vira "Vídeo incorreto : Batman A queda do morcego parte 2"
+// (no nome e na 1ª linha do título/descrição) e acrescenta uma linha com o motivo.
 function marcarIncorreto(s, m) {
-  const aviso = m.rotulo ? `⚠️ ${m.rotulo}: ${m.texto}` : `⚠️ VÍDEO INCORRETO (${m.por}): ${m.texto}`;
-  const r = Object.assign({}, s, { name: `⚠️ ${m.rotulo || 'INCORRETO'} | ${s.name || 'Stream'}` });
-  const resto = s.description || s.title || '';
-  r.description = resto ? `${aviso}\n${resto}` : aviso;
-  r.title = r.description;
-  return r;
+  const motivo = m.rotulo ? `${m.rotulo}: ${m.texto}` : `${m.por}: ${m.texto}`;
+  const base = s.description !== undefined ? s.description : s.title;
+  const linhas = String(base || '').split('\n');
+  const primeira = linhas.shift() || s.name || 'Stream';
+  const texto = [PREFIXO + primeira, `⚠️ ${motivo}`, ...linhas].join('\n');
+  return Object.assign({}, s, { name: PREFIXO + (s.name || 'Stream'), title: texto, description: texto });
+}
+
+// Bloqueio: o item deixa de ser tocável (sem url/infoHash/etc.) e vira um link externo para a página do título,
+// então o Stremio não abre o player. Com BLOQUEAR_INCORRETOS=0 só renomeia (continua tocando).
+function bloquearStream(s, m, imdb) {
+  const marcado = marcarIncorreto(s, m);
+  return { name: marcado.name, title: marcado.title, description: marcado.description, externalUrl: `https://www.imdb.com/title/${imdb}/` };
 }
 
 // ---------- addons de origem ----------
@@ -660,7 +673,7 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.5.0',
+    version: '1.6.0',
     name: 'Verificador de Duração',
     description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
     logo: `${base}/check_tempo.png`,
@@ -770,6 +783,7 @@ export default {
         return json({
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
+          bloqueio: BLOQUEAR ? 'ligado (item marcado não toca)' : 'desligado (só avisa)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
         });
       }
@@ -825,10 +839,10 @@ export default {
               else if (nomeDoArquivo(it.s)) situacao += ` | nome "${nomeDoArquivo(it.s).slice(0, 70)}" sem sinais de erro`;
             }
             log.push(`[${it.origem}] ${nome} -> ${situacao}`);
-            if (marca) s = marcarIncorreto(s, marca);
+            if (marca) s = BLOQUEAR ? bloquearStream(it.s, marca, id.split(':')[0]) : marcarIncorreto(s, marca);
             return s;
           }));
-          const incorretos = streams.filter((s) => /INCORRETO|NÃO LANÇADO/.test(s.name || '')).length;
+          const incorretos = streams.filter((s) => String(s.name || '').startsWith(PREFIXO)).length;
           console.log(`stream ${tipo} ${id}: ${streams.length} streams, TMDB ${rt || '?'} min, ${incorretos} incorretos`);
           for (const l of log) console.log('[verif]', id, l);
         } else {
