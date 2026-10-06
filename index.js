@@ -13,11 +13,16 @@
  * cabeçalho do arquivo por pedidos Range (MP4/MOV pelo átomo moov/mvhd; MKV/WebM pelo Info/Duration).
  * Formatos que não dê para ler (HLS .m3u8, TS, AVI, servidor sem Range...) tocam normalmente.
  *
+ * Os addons de origem NÃO são digitados: na página /configure você entra com a sua conta do Stremio, e o Worker
+ * lê a lista de addons instalados na conta e usa só os que têm "stream" (ignora o próprio Verificador).
+ *
  * Variáveis (Settings > Variables and Secrets) OU entradas de mesmo nome no KV ligado como "KV":
- *   TMDB_KEY (obrigatória)   UPSTREAM_URL (obrigatória; vários separados por espaço ou vírgula)
- *   SECRET (recomendada; sem ela usa a TMDB_KEY)   PUBLIC_URL (opcional)
+ *   TMDB_KEY (obrigatória)   SECRET (recomendada; sem ela usa a TMDB_KEY)
+ *   UPSTREAM_URL (opcional: links extras, separados por espaço ou vírgula)   PUBLIC_URL (opcional)
  *   TOLERANCIA (padrão 0.10)   TOLERANCIA_MIN (padrão 5)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  */
+const SELF_ID = 'community.verificador.duracao';
+const STREMIO_API = 'https://api.strem.io/api';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const TTL = 24 * 3600 * 1000;
 
@@ -345,6 +350,71 @@ async function veredito({ u, i, t }) {
   return r;
 }
 
+// ---------- lista de addons da conta do Stremio ----------
+function lerConfigConta(b64) {
+  if (!b64) return null;
+  try {
+    const j = JSON.parse(td.decode(b64uParaBytes(b64)));
+    return j && typeof j.k === 'string' && j.k ? j : null;
+  } catch { return null; }
+}
+const limparUrl = (u) => String(u || '').trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, '');
+function hostDe(u) { try { return new URL(u).hostname; } catch { return ''; } }
+
+// devolve { types, prefixes } se o manifest tem o recurso "stream" (como texto ou como objeto), senão null
+function recursoStream(m) {
+  for (const r of (m.resources || [])) {
+    if (typeof r === 'string') { if (r === 'stream') return { types: m.types || [], prefixes: m.idPrefixes || [] }; }
+    else if (r && r.name === 'stream') return { types: r.types || m.types || [], prefixes: r.idPrefixes || m.idPrefixes || [] };
+  }
+  return null;
+}
+
+const cacheContas = new Map();
+async function addonsDaConta(authKey) {
+  const hit = cacheContas.get(authKey);
+  if (hit && Date.now() - hit.t < 5 * 60 * 1000) return hit.lista;
+  const r = await fetch(`${STREMIO_API}/addonCollectionGet`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': UA },
+    body: JSON.stringify({ type: 'AddonCollectionGet', authKey, update: true }),
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error('Stremio HTTP ' + r.status);
+  const j = await r.json();
+  if (!j.result || !Array.isArray(j.result.addons)) throw new Error('sessão do Stremio inválida ou expirada (gere o link de novo em /configure)');
+  const lista = [];
+  for (const a of j.result.addons) {
+    if (!a || !a.manifest || a.manifest.id === SELF_ID || !/^https?:/i.test(a.transportUrl || '')) continue;
+    const rec = recursoStream(a.manifest);
+    if (!rec) continue; // só quem tem stream
+    lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
+  }
+  if (cacheContas.size >= 200) cacheContas.clear();
+  cacheContas.set(authKey, { t: Date.now(), lista });
+  return lista;
+}
+
+// addons de origem para este pedido: os da conta (filtrados por tipo e prefixo do id) + UPSTREAM_URL, se houver
+async function listaDeOrigens(cfgB64, host, tipo, id) {
+  let lista = [];
+  let erro = null;
+  const cfg = lerConfigConta(cfgB64);
+  if (cfg) {
+    try { lista = await addonsDaConta(cfg.k); } catch (e) { erro = e.message; console.error('[conta Stremio]', e.message); }
+  }
+  lista = lista
+    .filter((a) => !a.types.length || !tipo || a.types.includes(tipo))
+    .filter((a) => !a.prefixes.length || !id || a.prefixes.some((p) => id.startsWith(p)));
+  for (const u of UPSTREAMS) lista.push({ n: hostDe(u), u, types: [], prefixes: [] });
+  const vistos = new Set();
+  const final = lista
+    .filter((a) => hostDe(a.u) !== host)          // nunca chama a si mesmo
+    .filter((a) => !vistos.has(a.u) && vistos.add(a.u))
+    .slice(0, 30);
+  return { lista: final, erro, temConta: !!cfg };
+}
+
 // ---------- addons de origem ----------
 async function streamsDe(base, tipo, id) {
   try {
@@ -372,7 +442,7 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.1.0',
+    version: '1.2.0',
     name: 'Verificador de Duração',
     description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
     logo: `${base}/check_tempo.png`,
@@ -380,6 +450,7 @@ function manifest(base) {
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
     catalogs: [],
+    behaviorHints: { configurable: true },
   };
 }
 
@@ -398,6 +469,57 @@ function texto(status, msg) {
   return new Response(msg, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' } });
 }
 
+function paginaConfig() {
+  const html = `<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verificador de Duração</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;background:#111;color:#fff;padding:20px}
+.box{max-width:460px;margin:auto;background:#222;padding:20px;border-radius:10px}
+input{width:100%;padding:10px;margin:6px 0;background:#333;border:1px solid #444;color:#fff;border-radius:6px;box-sizing:border-box;font:inherit}
+button{background:#e50914;color:#fff;border:0;padding:12px;width:100%;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;margin-top:8px}
+button.sec{background:#444}
+p{color:#aaa;font-size:13px;line-height:1.4}
+#msg{color:#ffb74d;font-size:14px;min-height:18px}
+</style></head><body><div class="box">
+<img src="/check_tempo.png" alt="" style="width:72px;height:72px;display:block;margin:0 auto 8px">
+<h2 style="text-align:center;margin:6px 0 12px">Verificador de Duração</h2>
+<p>Entre com a sua conta do Stremio. O verificador lê a lista de addons instalados na conta e usa sozinho só os que têm <b>stream</b>. O e-mail e a senha vão direto para o Stremio, não passam por este servidor.</p>
+<input type="email" id="email" placeholder="E-mail do Stremio" autocomplete="username">
+<input type="password" id="senha" placeholder="Senha" autocomplete="current-password">
+<button onclick="entrar()">Entrar e gerar link</button>
+<div id="msg"></div>
+<div id="resultado" style="display:none">
+<p>O link abaixo contém o acesso à sua conta: <b>não compartilhe</b>.</p>
+<input type="text" id="link" readonly onclick="this.select()">
+<button onclick="copiar()">Copiar link</button>
+<button class="sec" onclick="instalar()">Instalar no Stremio (app)</button>
+<button class="sec" onclick="instalarWeb()">Instalar no Stremio Web</button>
+</div></div>
+<script>
+var caminho='';
+function msg(t){document.getElementById('msg').textContent=t}
+function b64u(s){return btoa(unescape(encodeURIComponent(s))).split('+').join('-').split('/').join('_').split('=').join('')}
+function copiar(){var c=document.getElementById('link');c.select();document.execCommand('copy');msg('Link copiado!')}
+function instalar(){window.location.href='stremio://'+caminho}
+function instalarWeb(){window.open('https://web.stremio.com/#/addons?addon='+encodeURIComponent(location.protocol+'//'+caminho),'_blank')}
+async function entrar(){
+  msg('Entrando...');
+  try{
+    var r=await fetch('https://api.strem.io/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({type:'Login',email:document.getElementById('email').value.trim(),password:document.getElementById('senha').value,facebook:false})});
+    var j=await r.json();
+    if(!j.result||!j.result.authKey){msg('Login falhou: confira e-mail e senha.');return}
+    caminho=location.host+'/'+b64u(JSON.stringify({k:j.result.authKey}))+'/manifest.json';
+    document.getElementById('link').value=location.protocol+'//'+caminho;
+    document.getElementById('resultado').style.display='block';
+    msg('Pronto. Copie o link ou instale direto.');
+  }catch(e){msg('Erro: '+e.message)}
+}
+</script></body></html>`;
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
 export default {
   async fetch(request, env) {
     try {
@@ -408,7 +530,11 @@ export default {
       const url = new URL(request.url);
       const partes = url.pathname.split('/').filter(Boolean);
       const base = PUBLIC_URL || url.origin;
-      if (!partes.length || partes[0] === 'health') return json({ ok: true });
+      if (!partes.length) return Response.redirect(`${url.origin}/configure`, 302);
+      const RESERVADOS = ['configure', 'manifest.json', 'stream', 'play', 'health', 'diagnostico', 'check_tempo.png'];
+      const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift(); // /<config>/manifest.json, /<config>/stream/...
+      if (partes[0] === 'health') return json({ ok: true });
+      if (partes[0] === 'configure') return paginaConfig();
       if (partes[0] === 'manifest.json') return json(manifest(base));
 
       if (partes[0] === 'check_tempo.png') {
@@ -422,14 +548,19 @@ export default {
         if (TMDB_KEY) {
           try { await tmdb('/configuration'); tmdbTeste = 'ok'; } catch (e) { tmdbTeste = 'falhou: ' + String((e && e.message) || e); }
         }
-        return json({ tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, addons_de_origem: UPSTREAMS.length, secret_definido: !!SECRET, kv_ligado: !!KV });
+        const o = await listaDeOrigens(cfgB64, url.hostname, null, null);
+        return json({
+          tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
+          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
+        });
       }
 
       if (partes[0] === 'stream') {
         const tipo = decodeURIComponent(partes[1] || '');
         const id = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
-        const listas = await Promise.all(UPSTREAMS.map((u) => streamsDe(u, tipo, id)));
+        const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
+        const listas = await Promise.all(origens.lista.map((a) => streamsDe(a.u, tipo, id)));
         const todos = listas.flat();
         const streams = TMDB_KEY && SECRET ? await Promise.all(todos.map((s) => reescrever(s, base, tipo, id))) : todos;
         console.log(`stream ${tipo} ${id}: ${streams.length} streams (${streams.filter((s) => s && /\/play\//.test(s.url || '')).length} com conferência)`);
