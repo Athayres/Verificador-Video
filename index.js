@@ -1,325 +1,459 @@
-const SELF_ID = 'org.verificador.stream';
-const CINEMETA = 'https://v3-cinemeta.strem.io';
-const STREMIO_API = 'https://api.strem.io/api';
-const LOGO_URL = 'https://raw.githubusercontent.com/Athayres/Verificador-Video/refs/heads/main/check_tempo.jpg';
+/**
+ * Verificador de Duração – addon Stremio para Cloudflare Workers
+ * Adaptado do verificador.js (Node/Render). Mesma lógica:
+ *  1. O Stremio pede os streams a este addon (/stream/...).
+ *  2. Ele busca a lista nos addons de origem (UPSTREAM_URL) e reescreve cada link direto (http/https)
+ *     para apontar para ESTE Worker (/play/...). Torrents e outros tipos passam sem alteração.
+ *  3. Quando você ESCOLHE um link, o Stremio chama /play/...: o Worker lê a duração do vídeo e compara
+ *     com o runtime do TMDB (pelo tt).
+ *       - bate (ou não deu para ler) -> redireciona para o link original e o vídeo toca
+ *       - não bate                   -> responde erro e o vídeo NÃO abre
+ *
+ * DIFERENÇA para o Render: o Worker não executa programas (não existe ffprobe). A duração é lida do
+ * cabeçalho do arquivo por pedidos Range (MP4/MOV pelo átomo moov/mvhd; MKV/WebM pelo Info/Duration).
+ * Formatos que não dê para ler (HLS .m3u8, TS, AVI, servidor sem Range...) tocam normalmente.
+ *
+ * Variáveis (Settings > Variables and Secrets) OU entradas de mesmo nome no KV ligado como "KV":
+ *   TMDB_KEY (obrigatória)   UPSTREAM_URL (obrigatória; vários separados por espaço ou vírgula)
+ *   SECRET (recomendada; sem ela usa a TMDB_KEY)   PUBLIC_URL (opcional)
+ *   TOLERANCIA (padrão 0.10)   TOLERANCIA_MIN (padrão 5)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
+ */
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const TTL = 24 * 3600 * 1000;
 
-const CACHE_MS = 5 * 60 * 1000;
-const STREAM_TIMEOUT = 8000;
-const STREAM_CACHE_MS = 2 * 60 * 1000;
-const META_CACHE_MS = 24 * 60 * 60 * 1000;
+let TMDB_KEY = '';
+let UPSTREAMS = [];
+let PUBLIC_URL = '';
+let SECRET = '';
+let KV = null;
+let TOL = 0.10;
+let TOL_MIN = 5;
+let TIMEOUT = 8000;
 
-const cacheAddons = new Map();
-const cacheMeta = new Map();
-const cacheStreams = new Map();
-
-const HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
-    'Accept': 'application/json'
-};
-
-const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': '*',
-    'Content-Type': 'application/json; charset=utf-8'
-};
-
-const manifest = {
-    id: SELF_ID,
-    version: '6.2.0',
-    name: 'Verificador de Streams ⚠️',
-    description: 'Junta os streams dos seus outros addons e avisa quando o conteúdo parece incorreto.',
-    types: ['movie', 'series'],
-    catalogs: [],
-    resources: ['stream'],
-    idPrefixes: ['tt'],
-    behaviorHints: { configurable: true },
-    logo: LOGO_URL
-};
-
-// ---------- Utilitários ----------
-const limparUrl = (u) => String(u || '').trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, '');
-
-async function fetchJson(url, ms = 8000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ms);
-    try {
-        const r = await fetch(url, { signal: controller.signal, headers: HEADERS });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return await r.json();
-    } finally {
-        clearTimeout(timer);
-    }
+async function carregarConfig(env) {
+  KV = env.KV || null;
+  const ler = async (nome) => {
+    let v = String(env[nome] || '').trim();
+    if (!v && KV) { try { v = String((await KV.get(nome, { cacheTtl: 300 })) || '').trim(); } catch {} }
+    return v;
+  };
+  TMDB_KEY = await ler('TMDB_KEY');
+  UPSTREAMS = (await ler('UPSTREAM_URL')).split(/[\s,]+/).filter(Boolean)
+    .map((u) => u.replace(/\/manifest\.json$/, '').replace(/\/+$/, ''));
+  PUBLIC_URL = String(env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  SECRET = (await ler('SECRET')) || TMDB_KEY;
+  TOL = Number(env.TOLERANCIA || 0.10);
+  TOL_MIN = Number(env.TOLERANCIA_MIN || 5);
+  TIMEOUT = Number(env.FFPROBE_TIMEOUT || 8000);
 }
 
-async function postJson(url, corpo, ms = 10000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ms);
-    try {
-        const r = await fetch(url, {
-            method: 'POST',
-            signal: controller.signal,
-            headers: { ...HEADERS, 'Content-Type': 'application/json' },
-            body: JSON.stringify(corpo)
-        });
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return await r.json();
-    } finally {
-        clearTimeout(timer);
-    }
+// ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
+const te = new TextEncoder();
+const td = new TextDecoder();
+function bytesParaB64u(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
-
-const normalizar = (s) =>
-    String(s || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, ' ')
-        .trim();
-
-function nomeDoHost(u) {
-    try { return new URL(u).hostname; } catch (e) { return 'addon'; }
+function b64uParaBytes(str) {
+  let b = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while (b.length % 4) b += '=';
+  return Uint8Array.from(atob(b), (c) => c.charCodeAt(0));
 }
-
-function temStream(m) {
-    return (m.resources || []).some(r => (typeof r === 'string' ? r : r && r.name) === 'stream');
+let chaveHmac = null;
+let chaveDoSegredo = '';
+async function getChave() {
+  if (!chaveHmac || chaveDoSegredo !== SECRET) {
+    chaveHmac = await crypto.subtle.importKey('raw', te.encode(SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+    chaveDoSegredo = SECRET;
+  }
+  return chaveHmac;
 }
-
-function parseConfig(configStr) {
-    if (!configStr) return null;
-    try {
-        let b64 = configStr.replace(/-/g, '+').replace(/_/g, '/');
-        while (b64.length % 4) b64 += '=';
-        const jsonStr = decodeURIComponent(escape(atob(b64)));
-        return JSON.parse(jsonStr);
-    } catch (e) {
-        return null;
-    }
+async function criarToken(obj) {
+  const p = bytesParaB64u(te.encode(JSON.stringify(obj)));
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', await getChave(), te.encode(p)));
+  return p + '.' + bytesParaB64u(sig);
 }
-
-async function addonsDaConta(authKey) {
-    const hit = cacheAddons.get(authKey);
-    if (hit && Date.now() - hit.t < CACHE_MS) return hit.lista;
-
-    const j = await postJson(`${STREMIO_API}/addonCollectionGet`, { type: 'AddonCollectionGet', authKey, update: true });
-    if (!j.result || !Array.isArray(j.result.addons)) {
-        throw new Error('sessão do Stremio inválida ou expirada');
-    }
-    const lista = j.result.addons
-        .filter(a => a && a.manifest && a.manifest.id !== SELF_ID && temStream(a.manifest) && /^https?:/i.test(a.transportUrl || ''))
-        .map(a => ({ n: a.manifest.name, u: a.transportUrl, types: a.manifest.types || [], prefixes: a.manifest.idPrefixes || null }));
-
-    cacheAddons.set(authKey, { t: Date.now(), lista });
-    return lista;
-}
-
-async function listaDeAddons(config, host, type, id) {
-    let lista = [];
-    const cfg = parseConfig(config);
-
-    if (cfg && cfg.k) {
-        try {
-            lista = await addonsDaConta(cfg.k);
-        } catch (e) {
-            console.error('[CONTA STREMIO ERRO]:', e.message);
-        }
-    }
-
-    const vistos = new Set();
-    return lista
-        .map(a => ({ ...a, n: a.n || nomeDoHost(a.u), u: limparUrl(a.u) }))
-        .filter(a => /^https?:\/\//i.test(a.u))
-        .filter(a => nomeDoHost(a.u) !== String(host || '').split(':')[0])
-        .filter(a => !a.types || a.types.length === 0 || a.types.includes(type))
-        .filter(a => !a.prefixes || a.prefixes.length === 0 || a.prefixes.some(p => id.startsWith(p)))
-        .filter(a => !vistos.has(a.u) && vistos.add(a.u));
-}
-
-async function fetchCinemeta(type, id) {
-    const baseId = id.split(':')[0];
-    const chave = `${type}/${baseId}`;
-    const hit = cacheMeta.get(chave);
-    if (hit && Date.now() - hit.t < META_CACHE_MS) return hit.meta;
-    try {
-        const data = await fetchJson(`${CINEMETA}/meta/${type}/${baseId}.json`);
-        const meta = data.meta || null;
-        if (meta) cacheMeta.set(chave, { t: Date.now(), meta });
-        return meta;
-    } catch (err) {
-        return null;
-    }
-}
-
-async function streamsDoAddon(a, type, id) {
-    const chave = `${a.u}|${type}|${id}`;
-    const hit = cacheStreams.get(chave);
-    if (hit && Date.now() - hit.t < STREAM_CACHE_MS) return hit.lista;
-    const data = await fetchJson(`${a.u}/stream/${type}/${id}.json`, STREAM_TIMEOUT);
-    const lista = Array.isArray(data.streams) ? data.streams : [];
-    cacheStreams.set(chave, { t: Date.now(), lista });
-    if (cacheStreams.size > 500) cacheStreams.delete(cacheStreams.keys().next().value);
-    return lista;
-}
-
-function palavrasDoTitulo(titulo) {
-    return normalizar(titulo).split(' ').filter(p => p.length > 3);
-}
-
-function streamIncorreto(stream, palavras) {
-    if (!palavras || palavras.length === 0) return false;
-    const texto = normalizar([
-        stream.title,
-        stream.description,
-        stream.name,
-        stream.filename,
-        stream.behaviorHints && stream.behaviorHints.filename
-    ].filter(Boolean).join(' '));
-    return !palavras.some(p => texto.includes(p));
-}
-
-function marcar(stream, addonNome, incorreto) {
-    const r = { ...stream, name: `${incorreto ? '⚠️ ' : ''}[${addonNome}] ${stream.name || 'Stream'}` };
-    if (incorreto) {
-        const detalhe = stream.title || stream.description || stream.filename || 'Sem detalhes';
-        if (stream.description !== undefined) r.description = `⚠️ [CONTEÚDO INCORRETO] ${stream.description}`;
-        if (stream.title !== undefined || stream.description === undefined) r.title = `⚠️️ [CONTEÚDO INCORRETO] ${stream.title || detalhe}`;
-    }
-    return r;
-}
-
-// ---------- Página HTML de Configuração ----------
-function renderConfigurePage(host, protocol) {
-    const html = `<!DOCTYPE html>
-<html lang="pt">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Configurar Verificador</title>
-<style>
-body { font-family: Arial, sans-serif; background: #111; color: #fff; padding: 20px; }
-.box { max-width: 460px; margin: auto; background: #222; padding: 20px; border-radius: 8px; }
-input { width: 100%; padding: 10px; margin: 6px 0; background: #333; border: 1px solid #444; color: #fff; border-radius: 4px; box-sizing: border-box; }
-button { background: #e50914; color: #fff; border: 0; padding: 12px; width: 100%; border-radius: 4px; font-weight: bold; font-size: 15px; cursor: pointer; margin-top: 8px; }
-p { color: #aaa; font-size: 13px; }
-#msg { color: #ffb74d; font-size: 14px; min-height: 18px; }
-</style>
-</head>
-<body>
-<div class="box">
-  <img src="/check_tempo.jpg" alt="Logo" style="width:72px;height:72px;display:block;margin:0 auto 8px" onerror="this.style.display='none'">
-  <h2 style="text-align:center">Verificador de Streams</h2>
-  <p>Entre com a sua conta do Stremio. O Verificador passa a usar automaticamente todos os addons com streams que você tiver instalados.</p>
-  <input type="email" id="email" placeholder="E-mail do Stremio">
-  <input type="password" id="senha" placeholder="Senha">
-  <button onclick="entrar()">Entrar e gerar link</button>
-  <div id="msg"></div>
-  <div id="resultado" style="display:none">
-    <p>Link do addon (cole em Stremio &gt; Addons &gt; campo de busca/URL):</p>
-    <input type="text" id="link" readonly onclick="this.select()">
-    <button onclick="copiar()">Copiar link</button>
-    <button onclick="instalar()" style="background:#444">Instalar no Stremio</button>
-  </div>
-</div>
-<script>
-var caminho = '';
-function msg(t) { document.getElementById('msg').textContent = t; }
-function copiar() {
-  var campo = document.getElementById('link');
-  campo.select();
-  document.execCommand('copy');
-  msg('Link copiado!');
-}
-function instalar() { window.location.href = 'stremio://' + caminho; }
-function b64u(s) {
-  return btoa(unescape(encodeURIComponent(s))).split('+').join('-').split('/').join('_').split('=').join('');
-}
-async function entrar() {
-  msg('A entrar...');
+async function lerToken(tok) {
+  const [p, sig] = String(tok || '').split('.');
+  if (!p || !sig) return null;
   try {
-    var r = await fetch('https://api.strem.io/api/login', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'Login', email: document.getElementById('email').value.trim(), password: document.getElementById('senha').value, facebook: false })
-    });
-    var j = await r.json();
-    if (!j.result || !j.result.authKey) { msg('Login falhou: confira e-mail e senha.'); return; }
-    caminho = '${host}/' + b64u(JSON.stringify({ k: j.result.authKey })) + '/manifest.json';
-    document.getElementById('link').value = '${protocol}://' + caminho;
-    document.getElementById('resultado').style.display = 'block';
-    msg('Pronto. Copie o link ou instale direto.');
-  } catch (e) {
-    msg('Erro: ' + e.message);
+    const ok = await crypto.subtle.verify('HMAC', await getChave(), b64uParaBytes(sig), te.encode(p));
+    return ok ? JSON.parse(td.decode(b64uParaBytes(p))) : null;
+  } catch { return null; }
+}
+
+// ---------- caches (memória do Worker + KV, se ligado) ----------
+const mem = { runtime: new Map(), vered: new Map() };
+async function hashCurto(s) {
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(s)));
+  return Array.from(h.subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function cLer(tipo, chave) {
+  const m = mem[tipo];
+  const e = m.get(chave);
+  if (e && Date.now() - e.t < TTL) return e.v;
+  if (e) m.delete(chave);
+  if (KV) {
+    try {
+      const w = await KV.get(`${tipo}:${await hashCurto(chave)}`, 'json');
+      if (w) { m.set(chave, { v: w.v, t: Date.now() }); return w.v; }
+    } catch {}
+  }
+  return undefined;
+}
+async function cGravar(tipo, chave, v) {
+  const m = mem[tipo];
+  if (m.size >= 3000) m.clear();
+  m.set(chave, { v, t: Date.now() });
+  if (KV) {
+    try { await KV.put(`${tipo}:${await hashCurto(chave)}`, JSON.stringify({ v }), { expirationTtl: 24 * 3600 }); } catch {}
   }
 }
-</script>
-</body>
-</html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+
+// ---------- TMDB: runtime em minutos ----------
+async function tmdb(caminho, params = {}) {
+  const u = new URL('https://api.themoviedb.org/3' + caminho);
+  u.searchParams.set('api_key', TMDB_KEY);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  let erro = null;
+  for (let t = 0; t < 3; t++) {
+    if (t) await new Promise((ok) => setTimeout(ok, t * 400));
+    try {
+      const r = await fetch(u, { signal: AbortSignal.timeout(10000) });
+      if (r.ok) return await r.json();
+      erro = new Error('TMDB ' + r.status);
+      if (r.status !== 429 && r.status < 500) break;
+    } catch (e) {
+      erro = e;
+      if (e && e.name === 'TimeoutError') break;
+    }
+  }
+  throw erro;
 }
 
-// ---------- Main Fetch Handler para Cloudflare Workers ----------
-export default {
-    async fetch(request, env, ctx) {
-        const url = new URL(request.url);
-        const path = url.pathname;
-        const host = url.host;
-        const protocol = url.protocol.replace(':', '');
+function partesDoId(id) {
+  const [imdb, t, e] = String(id).split(':');
+  return { imdb, temporada: Number(t) > 0 ? Number(t) : null, episodio: Number(e) > 0 ? Number(e) : null };
+}
 
-        if (request.method === 'OPTIONS') {
-            return new Response(null, { status: 204, headers: corsHeaders });
-        }
-
-        // 1. Redirecionamentos e Página de Configuração
-        if (path === '/') {
-            return Response.redirect(`${url.origin}/configure`, 302);
-        }
-        if (path === '/configure') {
-            return renderConfigurePage(host, protocol);
-        }
-
-        // 2. Manifesto
-        if (path === '/manifest.json' || /^\/[^\/]+\/manifest\.json$/.test(path)) {
-            return new Response(JSON.stringify(manifest), { headers: corsHeaders });
-        }
-
-        // 3. Logótipo redireciona direto para o raw do GitHub
-        if (path === '/check_tempo.jpg') {
-            return Response.redirect(LOGO_URL, 302);
-        }
-
-        // 4. Streams
-        const streamRegex = /^(?:\/([^\/]+))?\/stream\/(movie|series)\/(tt\d+(?::\d+:\d+)?)\.json$/;
-        const match = path.match(streamRegex);
-
-        if (match) {
-            const config = match[1];
-            const type = match[2];
-            const id = match[3];
-
-            const metaP = fetchCinemeta(type, id);
-            const addons = await listaDeAddons(config, host, type, id);
-
-            if (addons.length === 0) {
-                return new Response(JSON.stringify({ streams: [] }), { headers: corsHeaders });
-            }
-
-            const addonsP = addons.map(a => streamsDoAddon(a, type, id));
-            const [meta, resultados] = await Promise.all([metaP, Promise.allSettled(addonsP)]);
-
-            const tituloOficial = meta && meta.name ? meta.name : '';
-            const palavras = palavrasDoTitulo(tituloOficial);
-
-            const streams = [];
-            resultados.forEach((r, i) => {
-                const a = addons[i];
-                if (r.status !== 'fulfilled') return;
-                r.value.forEach(s => {
-                    const incorreto = streamIncorreto(s, palavras);
-                    streams.push(marcar(s, a.n, incorreto));
-                });
-            });
-
-            return new Response(JSON.stringify({ streams, cacheMaxAge: 120 }), { headers: corsHeaders });
-        }
-
-        return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: corsHeaders });
+async function runtimeMin(id, tipo) {
+  const c = await cLer('runtime', id + '|' + tipo);
+  if (c !== undefined) return c;
+  const { imdb, temporada, episodio } = partesDoId(id);
+  const f = await tmdb(`/find/${imdb}`, { external_source: 'imdb_id' });
+  let min = null;
+  if (tipo === 'movie') {
+    const m = (f.movie_results || [])[0];
+    if (m) min = (await tmdb(`/movie/${m.id}`)).runtime || null;
+  } else {
+    const s = (f.tv_results || [])[0];
+    if (s) {
+      if (temporada && episodio) {
+        try { min = (await tmdb(`/tv/${s.id}/season/${temporada}/episode/${episodio}`)).runtime || null; } catch { /* usa o geral */ }
+      }
+      if (!min) {
+        const d = await tmdb(`/tv/${s.id}`);
+        min = (d.episode_run_time && d.episode_run_time[0]) || (d.last_episode_to_air && d.last_episode_to_air.runtime) || null;
+      }
     }
+  }
+  await cGravar('runtime', id + '|' + tipo, min);
+  return min;
+}
+
+// ---------- duração do arquivo (substitui o ffprobe): lê só o cabeçalho com pedidos Range ----------
+async function lerFaixa(url, ini, tam) {
+  const r = await fetch(url, {
+    headers: { Range: `bytes=${ini}-${ini + tam - 1}`, 'User-Agent': UA, Accept: '*/*' },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(TIMEOUT),
+  });
+  if (r.status !== 206 && r.status !== 200) { try { await r.body.cancel(); } catch {} return null; }
+  const semRange = r.status === 200; // o servidor ignorou o Range: o corpo começa no byte 0
+  const cr = r.headers.get('content-range');
+  const m = cr && cr.match(/\/(\d+)\s*$/);
+  const total = m ? Number(m[1]) : (Number(r.headers.get('content-length')) || null);
+  if (semRange && ini > 0) { try { await r.body.cancel(); } catch {} return { dados: null, total, semRange }; }
+  const leitor = r.body.getReader();
+  const partes = [];
+  let lidos = 0;
+  while (lidos < tam) {
+    const { done, value } = await leitor.read();
+    if (done) break;
+    partes.push(value);
+    lidos += value.length;
+  }
+  try { await leitor.cancel(); } catch {}
+  const dados = new Uint8Array(Math.min(lidos, tam));
+  let p = 0;
+  for (const v of partes) {
+    const n = Math.min(v.length, dados.length - p);
+    if (n <= 0) break;
+    dados.set(v.subarray(0, n), p);
+    p += n;
+  }
+  return { dados, total, semRange };
+}
+
+function mvhdSegundos(c) {
+  for (let i = 4; i + 4 <= c.length; i++) {
+    if (c[i] === 0x6d && c[i + 1] === 0x76 && c[i + 2] === 0x68 && c[i + 3] === 0x64) { // 'mvhd'
+      const b = i + 4;
+      const dv = new DataView(c.buffer, c.byteOffset, c.byteLength);
+      let escala;
+      let dur;
+      if (c[b] === 1) {
+        if (b + 32 > c.length) return null;
+        escala = dv.getUint32(b + 20);
+        dur = Number(dv.getBigUint64(b + 24));
+      } else {
+        if (b + 20 > c.length) return null;
+        escala = dv.getUint32(b + 12);
+        dur = dv.getUint32(b + 16);
+      }
+      if (!escala || !dur || dur >= 0xFFFFFFFF) return null; // fragmentado/desconhecido
+      return dur / escala;
+    }
+  }
+  return null;
+}
+
+async function duracaoMP4(url, ini) {
+  const d0 = ini.dados;
+  const total = ini.total;
+  const ler = async (off, tam) => {
+    if (off < d0.length && (off + tam <= d0.length || (total != null && d0.length >= total))) return d0.subarray(off, Math.min(off + tam, d0.length));
+    if (ini.semRange) return null; // sem Range não dá para pular até o moov
+    const r = await lerFaixa(url, off, tam);
+    return r && r.dados;
+  };
+  let off = 0;
+  for (let n = 0; n < 12; n++) {
+    const cab = await ler(off, 16);
+    if (!cab || cab.length < 8) return null;
+    const dv = new DataView(cab.buffer, cab.byteOffset, cab.byteLength);
+    let tam = dv.getUint32(0);
+    const tipo = String.fromCharCode(cab[4], cab[5], cab[6], cab[7]);
+    if (tam === 1) {
+      if (cab.length < 16) return null;
+      tam = Number(dv.getBigUint64(8));
+    } else if (tam === 0) {
+      tam = total ? total - off : 0;
+    }
+    if (tipo === 'moov') {
+      const corpo = await ler(off, Math.min(tam, 8192));
+      return corpo ? mvhdSegundos(corpo) : null;
+    }
+    if (!(tam >= 8)) return null;
+    off += tam;
+    if (total && off >= total) return null;
+  }
+  return null;
+}
+
+function lerVint(d, p, ehId) {
+  const b = d[p];
+  if (b === undefined || b === 0) return null;
+  let len = 1;
+  let mask = 0x80;
+  while (!(b & mask)) { len++; mask >>= 1; }
+  if (p + len > d.length) return null;
+  let v = ehId ? b : (b & (mask - 1));
+  let tudoUm = (b & (mask - 1)) === (mask - 1);
+  for (let i = 1; i < len; i++) { v = v * 256 + d[p + i]; if (d[p + i] !== 0xFF) tudoUm = false; }
+  return { v, len, desconhecido: !ehId && tudoUm };
+}
+function lerUint(bytes) { let v = 0; for (const b of bytes) v = v * 256 + b; return v; }
+
+function infoMKV(d, ini, fim) {
+  let escala = 1000000;
+  let dur = null;
+  let p = ini;
+  while (p < fim) {
+    const id = lerVint(d, p, true);
+    if (!id) break;
+    p += id.len;
+    const sz = lerVint(d, p, false);
+    if (!sz) break;
+    p += sz.len;
+    const corpo = d.subarray(p, Math.min(p + sz.v, d.length));
+    if (id.v === 0x2AD7B1) escala = lerUint(corpo);
+    else if (id.v === 0x4489 && (corpo.length === 4 || corpo.length === 8)) {
+      const dv = new DataView(corpo.buffer, corpo.byteOffset, corpo.byteLength);
+      dur = corpo.length === 4 ? dv.getFloat32(0) : dv.getFloat64(0);
+    }
+    p += sz.v;
+  }
+  return dur != null && Number.isFinite(dur) ? (dur * escala) / 1e9 : null;
+}
+
+function duracaoMKV(d) {
+  let p = 0;
+  while (p < d.length) {
+    const id = lerVint(d, p, true);
+    if (!id) return null;
+    p += id.len;
+    const sz = lerVint(d, p, false);
+    if (!sz) return null;
+    p += sz.len;
+    if (id.v === 0x18538067) continue;                 // Segment: entra nos filhos
+    if (id.v === 0x1549A966) return infoMKV(d, p, Math.min(p + sz.v, d.length)); // Info
+    if (id.v === 0x1F43B675) return null;              // Cluster antes do Info
+    if (sz.desconhecido) return null;
+    p += sz.v;
+  }
+  return null;
+}
+
+// minutos, ou null se não deu para ler
+async function duracaoArquivo(url) {
+  try {
+    const ini = await lerFaixa(url, 0, 65536);
+    if (!ini || !ini.dados || ini.dados.length < 12) return null;
+    const d = ini.dados;
+    let seg = null;
+    if (d[4] === 0x66 && d[5] === 0x74 && d[6] === 0x79 && d[7] === 0x70) { // 'ftyp' = MP4/MOV
+      seg = await duracaoMP4(url, ini);
+    } else if (d[0] === 0x1A && d[1] === 0x45 && d[2] === 0xDF && d[3] === 0xA3) { // EBML = MKV/WebM
+      seg = duracaoMKV(d);
+      if (seg == null && d.length >= 65536) {
+        const mais = await lerFaixa(url, 0, 524288);
+        if (mais && mais.dados) seg = duracaoMKV(mais.dados);
+      }
+    }
+    return Number.isFinite(seg) && seg > 0 ? seg / 60 : null;
+  } catch { return null; }
+}
+
+// 'ok' | 'errado' | 'nao_verificado'  (só "errado" impede o vídeo de abrir)
+async function veredito({ u, i, t }) {
+  const chave = `${i}|${t}|${u}`;
+  const c = await cLer('vered', chave);
+  if (c) return c;
+  if (!TMDB_KEY) return { status: 'nao_verificado' };
+  let r;
+  try {
+    const [rt, dur] = await Promise.all([runtimeMin(i, t), duracaoArquivo(u)]);
+    if (!rt || !dur) return { status: 'nao_verificado', tmdbMin: rt, arquivoMin: dur && Math.round(dur) };
+    const folga = Math.max(rt * TOL, TOL_MIN);
+    r = { status: Math.abs(dur - rt) <= folga ? 'ok' : 'errado', tmdbMin: rt, arquivoMin: Math.round(dur) };
+  } catch {
+    return { status: 'nao_verificado' };
+  }
+  await cGravar('vered', chave, r); // falha passageira não fica guardada
+  return r;
+}
+
+// ---------- addons de origem ----------
+async function streamsDe(base, tipo, id) {
+  try {
+    const r = await fetch(`${base}/stream/${tipo}/${encodeURIComponent(id)}.json`, {
+      headers: { 'User-Agent': UA, Accept: 'application/json' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return [];
+    const j = await r.json();
+    return Array.isArray(j.streams) ? j.streams : [];
+  } catch (e) {
+    console.error('origem falhou:', base, e && e.message);
+    return [];
+  }
+}
+
+// Só reescreve link direto sem cabeçalhos especiais (com cabeçalhos, o redirecionamento perderia eles).
+async function reescrever(s, base, tipo, id) {
+  const bh = s && s.behaviorHints;
+  if (!s || typeof s.url !== 'string' || !/^https?:\/\//i.test(s.url)) return s;
+  if (bh && bh.proxyHeaders) return s;
+  return Object.assign({}, s, { url: `${base}/play/${await criarToken({ u: s.url, i: id, t: tipo })}` });
+}
+
+function manifest(base) {
+  return {
+    id: 'community.verificador.duracao',
+    version: '1.1.0',
+    name: 'Verificador de Duração',
+    description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
+    logo: `${base}/check_tempo.png`,
+    resources: ['stream'],
+    types: ['movie', 'series'],
+    idPrefixes: ['tt'],
+    catalogs: [],
+  };
+}
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': '*',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+    },
+  });
+}
+function texto(status, msg) {
+  return new Response(msg, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' } });
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      if (request.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS' } });
+      }
+      await carregarConfig(env);
+      const url = new URL(request.url);
+      const partes = url.pathname.split('/').filter(Boolean);
+      const base = PUBLIC_URL || url.origin;
+      if (!partes.length || partes[0] === 'health') return json({ ok: true });
+      if (partes[0] === 'manifest.json') return json(manifest(base));
+
+      if (partes[0] === 'check_tempo.png') {
+        return new Response(b64uParaBytes(LOGO_B64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')), {
+          headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' },
+        });
+      }
+
+      if (partes[0] === 'diagnostico') { // mostra se as configurações foram lidas (nunca mostra as chaves)
+        let tmdbTeste = 'TMDB_KEY não definida';
+        if (TMDB_KEY) {
+          try { await tmdb('/configuration'); tmdbTeste = 'ok'; } catch (e) { tmdbTeste = 'falhou: ' + String((e && e.message) || e); }
+        }
+        return json({ tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, addons_de_origem: UPSTREAMS.length, secret_definido: !!SECRET, kv_ligado: !!KV });
+      }
+
+      if (partes[0] === 'stream') {
+        const tipo = decodeURIComponent(partes[1] || '');
+        const id = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
+        if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
+        const listas = await Promise.all(UPSTREAMS.map((u) => streamsDe(u, tipo, id)));
+        const todos = listas.flat();
+        const streams = TMDB_KEY && SECRET ? await Promise.all(todos.map((s) => reescrever(s, base, tipo, id))) : todos;
+        console.log(`stream ${tipo} ${id}: ${streams.length} streams (${streams.filter((s) => s && /\/play\//.test(s.url || '')).length} com conferência)`);
+        return json({ streams });
+      }
+
+      if (partes[0] === 'play') {
+        const dados = await lerToken(partes[1]);
+        if (!dados || !/^https?:\/\//i.test(dados.u || '')) return texto(403, 'Link inválido');
+        const v = await veredito(dados);
+        console.log(`play ${dados.i} -> ${v.status}${v.arquivoMin ? ` (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)` : ''}`);
+        if (url.searchParams.get('debug')) return json(v);
+        if (v.status === 'errado') {
+          return texto(404, `Vídeo incorreto: o arquivo tem ${v.arquivoMin} min e o filme deveria ter cerca de ${v.tmdbMin} min.`);
+        }
+        return new Response(null, { status: 302, headers: { Location: dados.u, 'Cache-Control': 'no-store' } });
+      }
+
+      return json({ erro: 'não encontrado' }, 404);
+    } catch (e) {
+      console.error(e);
+      return json({ streams: [] }, 500);
+    }
+  },
 };
+
+const LOGO_B64 = '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';
