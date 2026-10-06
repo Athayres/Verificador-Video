@@ -37,6 +37,7 @@ let TOL_MIN = 5;
 let TIMEOUT = 8000;
 let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
+let OS_KEY = '';
 
 async function carregarConfig(env) {
   KV = env.KV || null;
@@ -55,6 +56,7 @@ async function carregarConfig(env) {
   TIMEOUT = Number(env.FFPROBE_TIMEOUT || 8000);
   ORCAMENTO_MS = Number(env.VERIFICACAO_MS || 8000);
   MAX_SONDAS = Number(env.MAX_SONDAS || 12);
+  OS_KEY = await ler('OPENSUBTITLES_KEY');
 }
 
 // ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
@@ -94,7 +96,7 @@ async function lerToken(tok) {
 }
 
 // ---------- caches (memória do Worker + KV, se ligado) ----------
-const mem = { runtime: new Map(), vered: new Map() };
+const mem = { runtime: new Map(), vered: new Map(), os: new Map() };
 async function hashCurto(s) {
   const h = new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(s)));
   return Array.from(h.subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -361,6 +363,81 @@ async function duracaoHLS(url) {
   return total > 0 ? total : null;
 }
 
+// ---------- autenticidade por site externo: o OpenSubtitles identifica o arquivo pelo "hash" ----------
+// hash = tamanho + soma (64 bits) dos primeiros e dos últimos 64 KB do arquivo
+function hashOpenSubtitles(inicio, fim, tamanho) {
+  let h = BigInt(tamanho);
+  const soma = (d) => {
+    const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+    for (let i = 0; i + 8 <= d.length; i += 8) h = (h + dv.getBigUint64(i, true)) & 0xFFFFFFFFFFFFFFFFn;
+  };
+  soma(inicio);
+  soma(fim);
+  return h.toString(16).padStart(16, '0');
+}
+
+async function hashDoArquivo(url) {
+  const ini = await lerFaixa(url, 0, 65536);
+  if (!ini || !ini.dados || ini.semRange || !ini.total || ini.total < 131072 || ini.dados.length < 65536) return null;
+  const fim = await lerFaixa(url, ini.total - 65536, 65536);
+  if (!fim || !fim.dados || fim.dados.length < 65536) return null;
+  return { hash: hashOpenSubtitles(ini.dados, fim.dados, ini.total), tamanho: ini.total };
+}
+
+const ttDe = (n) => (n && Number(n) ? 'tt' + String(n).padStart(7, '0') : null);
+
+// lista de títulos que o OpenSubtitles conhece para esse hash ([] = hash desconhecido; undefined = consulta falhou)
+async function consultarOpenSubtitles(hash, tamanho) {
+  const c = await cLer('os', hash);
+  if (c !== undefined) return c;
+  let achados;
+  try {
+    if (OS_KEY) {
+      const r = await fetch(`https://api.opensubtitles.com/api/v1/subtitles?moviehash=${hash}`, {
+        headers: { 'Api-Key': OS_KEY, 'User-Agent': 'VerificadorDuracao v1.0', Accept: 'application/json' },
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!r.ok) return undefined;
+      const j = await r.json();
+      achados = (j.data || []).filter((x) => x.attributes && x.attributes.moviehash_match).map((x) => {
+        const f = x.attributes.feature_details || {};
+        return { imdb: ttDe(f.imdb_id), serie: ttDe(f.parent_imdb_id), titulo: f.movie_name || f.title || '' };
+      });
+    } else { // sem chave: endereço antigo do OpenSubtitles (pode ser desligado a qualquer momento)
+      const r = await fetch(`https://rest.opensubtitles.org/search/moviebytesize-${tamanho}/moviehash-${hash}`, {
+        headers: { 'X-User-Agent': 'TemporaryUserAgent', Accept: 'application/json' },
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!r.ok) return undefined;
+      const j = await r.json();
+      achados = (Array.isArray(j) ? j : []).filter((x) => x.MatchedBy === 'moviehash').map((x) => ({
+        imdb: ttDe(x.IDMovieImdb), serie: ttDe(x.SeriesIMDBParent), titulo: x.MovieName || '',
+      }));
+    }
+  } catch { return undefined; }
+  await cGravar('os', hash, achados);
+  return achados;
+}
+
+// compara o que o OpenSubtitles sabe sobre o hash com o título pedido
+async function autenticidadePorHash(hash, tamanho, id) {
+  const achados = await consultarOpenSubtitles(hash, tamanho);
+  const POR = 'autenticidade, OpenSubtitles';
+  if (!achados || !achados.length) return { status: 'nao_verificado' };
+  const pedido = String(id).split(':')[0];
+  if (achados.some((a) => a.imdb === pedido || a.serie === pedido)) return { status: 'ok', por: POR, texto: 'o arquivo é reconhecido como este título' };
+  const a = achados.find((x) => x.imdb || x.serie);
+  if (!a) return { status: 'nao_verificado' };
+  return { status: 'errado', por: POR, texto: `este arquivo é conhecido como ${a.titulo ? `"${a.titulo}" ` : ''}(${a.serie || a.imdb}), não ${pedido}` };
+}
+
+async function autenticidadeDoLink(url, id) {
+  try {
+    const h = await hashDoArquivo(url);
+    return h ? await autenticidadePorHash(h.hash, h.tamanho, id) : { status: 'nao_verificado' };
+  } catch { return { status: 'nao_verificado' }; }
+}
+
 // minutos, ou null se não deu para ler
 async function duracaoArquivo(url) {
   try {
@@ -392,9 +469,14 @@ async function veredito({ u, i, t }, rtConhecido) {
   let r;
   try {
     const [rt, dur] = await Promise.all([rtConhecido !== undefined ? rtConhecido : runtimeMin(i, t), duracaoArquivo(u)]);
-    if (!rt || !dur) return { status: 'nao_verificado', tmdbMin: rt, arquivoMin: dur && Math.round(dur) };
-    const folga = Math.max(rt * TOL, TOL_MIN);
-    r = { status: Math.abs(dur - rt) <= folga ? 'ok' : 'errado', tmdbMin: rt, arquivoMin: Math.round(dur) };
+    if (rt && dur) {
+      const folga = Math.max(rt * TOL, TOL_MIN);
+      r = { status: Math.abs(dur - rt) <= folga ? 'ok' : 'errado', tmdbMin: rt, arquivoMin: Math.round(dur) };
+    } else {
+      const ext = dur ? null : await autenticidadeDoLink(u, i); // duração ilegível: pergunta ao site externo
+      if (ext && ext.status !== 'nao_verificado') r = ext;
+      else return { status: 'nao_verificado', tmdbMin: rt, arquivoMin: dur && Math.round(dur) };
+    }
   } catch {
     return { status: 'nao_verificado' };
   }
@@ -572,7 +654,7 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.3.0',
+    version: '1.4.0',
     name: 'Verificador de Duração',
     description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
     logo: `${base}/check_tempo.png`,
@@ -681,6 +763,7 @@ export default {
         const o = await listaDeOrigens(cfgB64, url.hostname, null, null);
         return json({
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
+          opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
         });
       }
@@ -713,11 +796,17 @@ export default {
             else if (!rt) situacao = 'TMDB sem duração';
             else if (!v) situacao = 'duração não medida (tempo ou limite de links)';
             else if (v.status === 'nao_verificado') situacao = 'não deu para ler a duração do arquivo';
-            else situacao = `${v.status.toUpperCase()} (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)`;
+            else situacao = `${v.status.toUpperCase()} (${v.texto || `arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min`})`;
             let marca = null;
-            if (v && v.status === 'errado') marca = { por: 'duração', texto: `o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min` };
-            else if (!v || v.status === 'nao_verificado') { // duração indisponível: confere pelo nome do arquivo
-              const motivo = info ? checarNome(it.s, tipo, id, info) : null;
+            if (v && v.status === 'errado') marca = v.por ? { por: v.por, texto: v.texto } : { por: 'duração', texto: `o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min` };
+            else if (!v || v.status === 'nao_verificado') { // duração indisponível
+              const bh = it.s.behaviorHints || {};
+              if (!ehDireto(it.s) && bh.videoHash && bh.videoSize) { // torrent/addon que informa o hash: pergunta ao site externo
+                const ext = await autenticidadePorHash(String(bh.videoHash), Number(bh.videoSize), id).catch(() => null);
+                if (ext && ext.status === 'errado') { marca = { por: ext.por, texto: ext.texto }; situacao = `ERRADO (${ext.texto})`; }
+                else if (ext && ext.status === 'ok') situacao = `OK (${ext.texto})`;
+              }
+              const motivo = !marca && info ? checarNome(it.s, tipo, id, info) : null;
               if (motivo) { marca = { por: 'nome do arquivo', texto: motivo }; situacao = `ERRADO pelo nome: ${motivo}`; }
               else if (nomeDoArquivo(it.s)) situacao += ` | nome "${nomeDoArquivo(it.s).slice(0, 70)}" sem sinais de erro`;
             }
@@ -738,10 +827,10 @@ export default {
         const dados = await lerToken(partes[1]);
         if (!dados || !/^https?:\/\//i.test(dados.u || '')) return texto(403, 'Link inválido');
         const v = await veredito(dados);
-        console.log(`play ${dados.i} -> ${v.status}${v.arquivoMin ? ` (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)` : ''}`);
+        console.log(`play ${dados.i} -> ${v.status}${v.texto ? ` (${v.texto})` : v.arquivoMin ? ` (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)` : ''}`);
         if (url.searchParams.get('debug')) return json(v);
         if (v.status === 'errado') {
-          return texto(404, `Vídeo incorreto: o arquivo tem ${v.arquivoMin} min e o filme deveria ter cerca de ${v.tmdbMin} min.`);
+          return texto(404, `Vídeo incorreto: ${v.texto || `o arquivo tem ${v.arquivoMin} min e o filme deveria ter cerca de ${v.tmdbMin} min`}.`);
         }
         return new Response(null, { status: 302, headers: { Location: dados.u, 'Cache-Control': 'no-store' } });
       }
