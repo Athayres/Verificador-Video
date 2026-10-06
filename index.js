@@ -157,11 +157,13 @@ async function infoTMDB(id, tipo) {
   let min = null;
   let ano = null;
   let titulos = [];
+  let lancamento = '';
   if (tipo === 'movie') {
     const m = (f.movie_results || [])[0];
     if (m) {
       min = (await tmdb(`/movie/${m.id}`)).runtime || null;
       ano = parseInt(String(m.release_date || '').slice(0, 4), 10) || null;
+      lancamento = String(m.release_date || '');
       titulos = [m.title, m.original_title].filter(Boolean);
     }
   } else {
@@ -169,7 +171,11 @@ async function infoTMDB(id, tipo) {
     if (sr) {
       titulos = [sr.name, sr.original_name].filter(Boolean);
       if (temporada && episodio) {
-        try { min = (await tmdb(`/tv/${sr.id}/season/${temporada}/episode/${episodio}`)).runtime || null; } catch { /* usa o geral */ }
+        try {
+          const ep = await tmdb(`/tv/${sr.id}/season/${temporada}/episode/${episodio}`);
+          min = ep.runtime || null;
+          lancamento = String(ep.air_date || '');
+        } catch { /* usa o geral */ }
       }
       if (!min) {
         const d = await tmdb(`/tv/${sr.id}`);
@@ -177,7 +183,7 @@ async function infoTMDB(id, tipo) {
       }
     }
   }
-  const info = { min, ano, titulos };
+  const info = { min, ano, titulos, lancamento };
   await cGravar('runtime', id + '|' + tipo, info);
   return info;
 }
@@ -619,8 +625,8 @@ function checarNome(s, tipo, id, info) {
 }
 
 function marcarIncorreto(s, m) {
-  const aviso = `⚠️ VÍDEO INCORRETO (${m.por}): ${m.texto}`;
-  const r = Object.assign({}, s, { name: `⚠️ INCORRETO | ${s.name || 'Stream'}` });
+  const aviso = m.rotulo ? `⚠️ ${m.rotulo}: ${m.texto}` : `⚠️ VÍDEO INCORRETO (${m.por}): ${m.texto}`;
+  const r = Object.assign({}, s, { name: `⚠️ ${m.rotulo || 'INCORRETO'} | ${s.name || 'Stream'}` });
   const resto = s.description || s.title || '';
   r.description = resto ? `${aviso}\n${resto}` : aviso;
   r.title = r.description;
@@ -654,7 +660,7 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.4.0',
+    version: '1.5.0',
     name: 'Verificador de Duração',
     description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
     logo: `${base}/check_tempo.png`,
@@ -782,8 +788,13 @@ export default {
           const t0 = Date.now();
           const info = await infoTMDB(id, tipo).catch(() => undefined);
           const rt = info ? info.min : undefined;
+          // título que só estreia no futuro: qualquer arquivo disponível agora é provavelmente falso
+          const amanha = new Date(Date.now() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+          const lanc = info && /^\d{4}-\d{2}-\d{2}$/.test(info.lancamento || '') ? info.lancamento : '';
+          const naoLancado = !!lanc && lanc > amanha;
+          const dataBR = lanc ? lanc.split('-').reverse().join('/') : '';
           let ver = { resultados: new Map(), semTempo: 0 };
-          if (rt) {
+          if (rt && !naoLancado) {
             const orcamento = Math.max(2500, Math.min(ORCAMENTO_MS, 12000 - (Date.now() - t0)));
             ver = await verificarLista(itens, id, tipo, rt, ctx, orcamento);
           }
@@ -798,7 +809,10 @@ export default {
             else if (v.status === 'nao_verificado') situacao = 'não deu para ler a duração do arquivo';
             else situacao = `${v.status.toUpperCase()} (${v.texto || `arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min`})`;
             let marca = null;
-            if (v && v.status === 'errado') marca = v.por ? { por: v.por, texto: v.texto } : { por: 'duração', texto: `o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min` };
+            if (naoLancado) {
+              marca = { rotulo: 'NÃO LANÇADO', texto: `este título só estreia em ${dataBR}; um arquivo disponível agora é provavelmente falso` };
+              situacao = `NÃO LANÇADO (estreia em ${dataBR})`;
+            } else if (v && v.status === 'errado') marca = v.por ? { por: v.por, texto: v.texto } : { por: 'duração', texto: `o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min` };
             else if (!v || v.status === 'nao_verificado') { // duração indisponível
               const bh = it.s.behaviorHints || {};
               if (!ehDireto(it.s) && bh.videoHash && bh.videoSize) { // torrent/addon que informa o hash: pergunta ao site externo
@@ -814,7 +828,7 @@ export default {
             if (marca) s = marcarIncorreto(s, marca);
             return s;
           }));
-          const incorretos = streams.filter((s) => /INCORRETO/.test(s.name || '')).length;
+          const incorretos = streams.filter((s) => /INCORRETO|NÃO LANÇADO/.test(s.name || '')).length;
           console.log(`stream ${tipo} ${id}: ${streams.length} streams, TMDB ${rt || '?'} min, ${incorretos} incorretos`);
           for (const l of log) console.log('[verif]', id, l);
         } else {
