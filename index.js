@@ -2,7 +2,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Tratar requisições OPTIONS (CORS pré-voo exigido pelo Stremio)
+    // Tratar requisições OPTIONS (CORS)
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -13,22 +13,20 @@ export default {
       });
     }
 
-    const pathParts = url.pathname.split('/');
-
-    // 2. Rota da Tela de Configuração (Página Inicial) com os 3 botões
-    if (url.pathname === '/' || url.pathname === '/configure') {
+    // 1. Rota da Tela de Configuração (Garante que exiba a página com os 3 botões)
+    if (url.pathname === '/' || url.pathname === '/configure' || url.pathname === '') {
       return new Response(getHtmlConfigPage(url.host), {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
       });
     }
 
-    // 3. Rota do Manifesto do Stremio
+    // 2. Rota do Manifesto do Stremio
     if (url.pathname === '/manifest.json') {
       const manifest = {
         id: 'org.stremio.addonfiltrado',
         version: '1.0.0',
         name: 'Addon Filtrado (Stremio)',
-        description: 'Addon inteligente que remove automaticamente streams incorretos.',
+        description: 'Remove automaticamente da lista streams com duração ou conteúdo incorreto.',
         types: ['movie', 'series'],
         catalogs: [],
         resources: ['stream'],
@@ -42,7 +40,8 @@ export default {
       });
     }
 
-    // 4. Rota de Streams (Busca, Valida e Filtra a lista)
+    // 3. Rota de Streams (Busca, Valida e Filtra a lista)
+    const pathParts = url.pathname.split('/');
     if (pathParts[1] === 'stream' && pathParts[2] && pathParts[3]) {
       const type = pathParts[2];
       const id = pathParts[3].replace('.json', '');
@@ -67,12 +66,12 @@ export default {
       }
     }
 
-    return new Response('Rota não encontrada', { status: 404 });
+    return new Response('Página não encontrada', { status: 404 });
   }
 };
 
 /**
- * Gera a página HTML de configuração com os botões: Instalar App, Instalar Web e Copiar Link
+ * HTML limpo e garantido com os 3 botões
  */
 function getHtmlConfigPage(host) {
   const stremioInstallUrl = `stremio://${host}/manifest.json`;
@@ -82,54 +81,102 @@ function getHtmlConfigPage(host) {
   return `<!DOCTYPE html>
   <html lang="pt-BR">
   <head>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Configuração - Addon Filtrado</title>
+    <title>Addon Filtrado - Stremio</title>
     <style>
-      body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 40px; margin: 0; }
-      .container { max-width: 520px; margin: 0 auto; background: #1e1e1e; padding: 35px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.7); }
-      h1 { color: #e50914; margin-bottom: 10px; font-size: 24px; }
-      p { color: #aaa; font-size: 14px; margin-bottom: 30px; line-height: 1.5; }
-      .btn-group { display: flex; flex-direction: column; gap: 12px; margin-bottom: 25px; }
-      .btn { display: block; background: #e50914; color: #fff; padding: 14px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 15px; transition: background 0.2s, transform 0.1s; border: none; cursor: pointer; }
-      .btn:hover { background: #b20710; }
-      .btn-web { background: #2d2d2d; border: 1px solid #444; }
-      .btn-web:hover { background: #3d3d3d; }
-      .btn-copy { background: #2563eb; }
-      .btn-copy:hover { background: #1d4ed8; }
-      .link-box { font-size: 12px; word-break: break-all; background: #161616; padding: 12px; border-radius: 6px; color: #888; border: 1px solid #333; }
-      #toast { margin-top: 10px; font-size: 12px; color: #4ade80; display: none; }
+      body {
+        background-color: #121212;
+        color: #ffffff;
+        font-family: Arial, sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+      }
+      .card {
+        background: #1e1e1e;
+        padding: 30px;
+        border-radius: 12px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        max-width: 440px;
+        width: 100%;
+        text-align: center;
+      }
+      h1 {
+        color: #e50914;
+        margin-bottom: 10px;
+        font-size: 22px;
+      }
+      p {
+        color: #b3b3b3;
+        font-size: 14px;
+        margin-bottom: 25px;
+        line-height: 1.4;
+      }
+      .btn {
+        display: block;
+        width: 100%;
+        padding: 12px;
+        margin-bottom: 12px;
+        border-radius: 6px;
+        font-weight: bold;
+        font-size: 14px;
+        text-decoration: none;
+        border: none;
+        cursor: pointer;
+        box-sizing: border-box;
+        transition: background 0.2s;
+      }
+      .btn-app { background-color: #e50914; color: #fff; }
+      .btn-app:hover { background-color: #b20710; }
+      
+      .btn-web { background-color: #2d2d2d; color: #fff; border: 1px solid #444; }
+      .btn-web:hover { background-color: #3d3d3d; }
+      
+      .btn-copy { background-color: #2563eb; color: #fff; }
+      .btn-copy:hover { background-color: #1d4ed8; }
+
+      .link-box {
+        background: #121212;
+        padding: 10px;
+        border-radius: 6px;
+        font-size: 11px;
+        color: #888;
+        word-break: break-all;
+        margin-top: 15px;
+        border: 1px solid #333;
+        text-align: left;
+      }
+      #toast {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #4ade80;
+        display: none;
+      }
     </style>
   </head>
   <body>
-    <div class="container">
+    <div class="card">
       <h1>Addon Filtrado</h1>
-      <p>Remove automaticamente da lista qualquer stream com duração ou conteúdo incorreto antes de exibi-lo no Stremio.</p>
+      <p>Remove automaticamente da lista os arquivos com durações ou conteúdos incorretos.</p>
       
-      <div class="btn-group">
-        <!-- 1. Instalar no Aplicativo (Desktop / Android App) -->
-        <a class="btn" href="${stremioInstallUrl}">Instalar no App (Stremio Desktop/Mobile)</a>
-        
-        <!-- 2. Instalar na Versão Web -->
-        <a class="btn btn-web" href="${stremioWebUrl}" target="_blank">Instalar na Versão Web</a>
-        
-        <!-- 3. Copiar Link do Manifesto -->
-        <button class="btn btn-copy" onclick="copiarLink()">Copiar Link do Manifesto</button>
-      </div>
+      <a href="${stremioInstallUrl}" class="btn btn-app">Instalar no App (Desktop/Mobile)</a>
+      <a href="${stremioWebUrl}" target="_blank" class="btn btn-web">Instalar na Versão Web</a>
+      <button onclick="copiarLink()" class="btn btn-copy">Copiar Link do Manifesto</button>
 
-      <div class="link-box" id="manifest-link">${httpsManifestUrl}</div>
-      <div id="toast">Link copiado para a área de transferência!</div>
+      <div class="link-box" id="manifestLink">${httpsManifestUrl}</div>
+      <div id="toast">Link copiado com sucesso!</div>
     </div>
 
     <script>
       function copiarLink() {
-        const link = document.getElementById('manifest-link').innerText;
+        const link = document.getElementById('manifestLink').innerText;
         navigator.clipboard.writeText(link).then(() => {
           const toast = document.getElementById('toast');
           toast.style.display = 'block';
-          setTimeout(() => {
-            toast.style.display = 'none';
-          }, 3000);
+          setTimeout(() => { toast.style.display = 'none'; }, 3000);
         });
       }
     </script>
@@ -139,40 +186,35 @@ function getHtmlConfigPage(host) {
 
 async function buscarStreamsDoProvedor(type, id, env) {
   try {
-    const respostaProvedor = await fetch(`https://torrentio.strem.fun/stream/${type}/${id}.json`, {
+    const res = await fetch(`https://torrentio.strem.fun/stream/${type}/${id}.json`, {
       headers: { 'User-Agent': 'StremioAddon/1.0.0' }
     });
-    if (!respostaProvedor.ok) return [];
-    const dados = await respostaProvedor.json();
-    return dados.streams || [];
-  } catch (err) {
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.streams || [];
+  } catch (e) {
     return [];
   }
 }
 
 async function filtrarStreamsInvalidos(streams, imdbId, env) {
   if (!Array.isArray(streams) || streams.length === 0) return [];
-
-  const promessasVerificacao = streams.map(async (stream) => {
-    const ehValido = await verificarDuracaoOuConteudo(stream, imdbId);
-    return { stream, valido: ehValido };
+  const checks = streams.map(async (stream) => {
+    const valid = await verificarDuracaoOuConteudo(stream, imdbId);
+    return { stream, valid };
   });
-
-  const resultados = await Promise.all(promessasVerificacao);
-
-  return resultados
-    .filter(item => item.valido)
-    .map(item => item.stream);
+  const results = await Promise.all(checks);
+  return results.filter(r => r.valid).map(r => r.stream);
 }
 
 async function verificarDuracaoOuConteudo(stream, imdbId) {
   try {
-    // Insira aqui a sua regra de validação real
+    // Adicione aqui a sua lógica de checagem real
     if (stream.title && stream.title.toLowerCase().includes("errado")) {
-      return false; 
+      return false;
     }
     return true;
-  } catch (err) {
+  } catch (e) {
     return false;
   }
 }
