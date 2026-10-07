@@ -5,6 +5,8 @@
  *     addons que têm "stream". Ficam de fora: este próprio verificador, o Controle de Impróprios (guia dos pais)
  *     e os addons que só têm catálogo/metadados.
  *  3. Cada link direto (http/https) é reescrito para apontar para ESTE Worker (/play/...). Torrents passam sem alteração.
+ *     Testes: duração (TMDB), tamanho do arquivo x duração, título gravado no MKV, reconhecimento pelo OpenSubtitles
+ *     (OPENSUBTITLES_KEY melhora muito) e nome do arquivo.
  *  4. A lista devolvida ao Stremio traz SÓ os vídeos que passaram no teste: o que o teste reprova (duração diferente
  *     do TMDB, arquivo reconhecido como outro título, nome do arquivo com outro filme/episódio, título não lançado)
  *     é REMOVIDO da lista. O que não deu para medir continua aparecendo e, se for escolhido, é conferido em /play/.
@@ -17,7 +19,7 @@
  * Variáveis (Settings > Variables and Secrets) OU entradas de mesmo nome no KV ligado como "KV":
  *   TMDB_KEY (obrigatória)   SECRET (recomendada; sem ela usa a TMDB_KEY)   PUBLIC_URL (opcional)
  *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
- *   TOLERANCIA (padrão 0.10)   TOLERANCIA_MIN (padrão 5)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
+ *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  */
 const SELF_ID = 'community.verificador.duracao';
 const STREMIO_API = 'https://api.strem.io/api';
@@ -32,8 +34,9 @@ let TMDB_KEY = '';
 let PUBLIC_URL = '';
 let SECRET = '';
 let KV = null;
-let TOL = 0.10;
-let TOL_MIN = 5;
+let TOL = 0.20;
+let TOL_MIN = 10;
+const MIN_KBPS = 100; // abaixo disso o arquivo é pequeno demais para a duração (trailer/placeholder)
 let TIMEOUT = 8000;
 let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
@@ -50,8 +53,8 @@ async function carregarConfig(env) {
   TMDB_KEY = await ler('TMDB_KEY');
   PUBLIC_URL = String(env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
   SECRET = (await ler('SECRET')) || TMDB_KEY;
-  TOL = Number(env.TOLERANCIA || 0.10);
-  TOL_MIN = Number(env.TOLERANCIA_MIN || 5);
+  TOL = Number(env.TOLERANCIA || 0.20);
+  TOL_MIN = Number(env.TOLERANCIA_MIN || 10);
   TIMEOUT = Number(env.FFPROBE_TIMEOUT || 8000);
   ORCAMENTO_MS = Number(env.VERIFICACAO_MS || 8000);
   MAX_SONDAS = Number(env.MAX_SONDAS || 12);
@@ -162,10 +165,11 @@ async function infoTMDB(id, tipo) {
   if (tipo === 'movie') {
     const m = (f.movie_results || [])[0];
     if (m) {
-      min = (await tmdb(`/movie/${m.id}`)).runtime || null;
+      const det = await tmdb(`/movie/${m.id}`, { language: 'pt-BR' });
+      min = det.runtime || null;
       ano = parseInt(String(m.release_date || '').slice(0, 4), 10) || null;
       lancamento = String(m.release_date || '');
-      titulos = [m.title, m.original_title].filter(Boolean);
+      titulos = [m.title, m.original_title, det.title].filter(Boolean);
     }
   } else {
     const sr = (f.tv_results || [])[0];
@@ -297,6 +301,7 @@ function lerUint(bytes) { let v = 0; for (const b of bytes) v = v * 256 + b; ret
 function infoMKV(d, ini, fim) {
   let escala = 1000000;
   let dur = null;
+  let titulo = '';
   let p = ini;
   while (p < fim) {
     const id = lerVint(d, p, true);
@@ -307,13 +312,14 @@ function infoMKV(d, ini, fim) {
     p += sz.len;
     const corpo = d.subarray(p, Math.min(p + sz.v, d.length));
     if (id.v === 0x2AD7B1) escala = lerUint(corpo);
+    else if (id.v === 0x7BA9) { try { titulo = td.decode(corpo); } catch { /* ignora */ } }
     else if (id.v === 0x4489 && (corpo.length === 4 || corpo.length === 8)) {
       const dv = new DataView(corpo.buffer, corpo.byteOffset, corpo.byteLength);
       dur = corpo.length === 4 ? dv.getFloat32(0) : dv.getFloat64(0);
     }
     p += sz.v;
   }
-  return dur != null && Number.isFinite(dur) ? (dur * escala) / 1e9 : null;
+  return { seg: dur != null && Number.isFinite(dur) ? (dur * escala) / 1e9 : null, titulo };
 }
 
 function duracaoMKV(d) {
@@ -445,26 +451,45 @@ async function autenticidadeDoLink(url, id) {
   } catch { return { status: 'nao_verificado' }; }
 }
 
-// minutos, ou null se não deu para ler
+// { min, total (bytes), titulo gravado } ou null se não deu para abrir o arquivo (min = null se a duração não foi lida)
 async function duracaoArquivo(url) {
   try {
     const ini = await lerFaixa(url, 0, 65536);
     if (!ini || !ini.dados || ini.dados.length < 12) return null;
     const d = ini.dados;
     let seg = null;
+    let titulo = '';
+    let total = ini.total;
     if (d[0] === 0x23 && d[1] === 0x45 && d[2] === 0x58 && d[3] === 0x54 && d[4] === 0x4D && d[5] === 0x33 && d[6] === 0x55) { // '#EXTM3U' = HLS
       seg = await duracaoHLS(url);
+      total = null;
     } else if (d[4] === 0x66 && d[5] === 0x74 && d[6] === 0x79 && d[7] === 0x70) { // 'ftyp' = MP4/MOV
       seg = await duracaoMP4(url, ini);
     } else if (d[0] === 0x1A && d[1] === 0x45 && d[2] === 0xDF && d[3] === 0xA3) { // EBML = MKV/WebM
-      seg = duracaoMKV(d);
-      if (seg == null && d.length >= 65536) {
+      let r = duracaoMKV(d);
+      if ((!r || r.seg == null) && d.length >= 65536) {
         const mais = await lerFaixa(url, 0, 524288);
-        if (mais && mais.dados) seg = duracaoMKV(mais.dados);
+        if (mais && mais.dados) r = duracaoMKV(mais.dados) || r;
       }
+      if (r) { seg = r.seg; titulo = r.titulo || ''; }
     }
-    return Number.isFinite(seg) && seg > 0 ? seg / 60 : null;
+    return { min: Number.isFinite(seg) && seg > 0 ? seg / 60 : null, total: total || null, titulo };
   } catch { return null; }
+}
+
+// compara o título gravado dentro do arquivo (MKV) com os títulos do filme; devolve o motivo ou null
+const PALAVRAS_VAZIAS = new Set(['the', 'and', 'for', 'dos', 'das', 'del', 'uma', 'com', 'que']);
+const palavrasDe = (t) => normalizar(t).split(' ').filter((w) => w.length > 2 && !PALAVRAS_VAZIAS.has(w));
+function checarTituloGravado(titulo, info) {
+  const t = String(titulo || '').trim();
+  if (t.length < 4 || !info) return null;
+  // lixo de release (site, qualidade, codificador) não é título: não conta
+  if (/www\.|https?:|\.(com|net|org|to|cc|tv)\b|encod|releas|\brip\b|x26[45]|1080p|720p|2160p|blu-?ray|web-?dl|yts|rarbg|torrent/i.test(t)) return null;
+  const doArquivo = palavrasDe(t);
+  const doFilme = new Set(palavrasDe((info.titulos || []).join(' ')));
+  if (!doArquivo.length || !doFilme.size) return null;
+  if (doArquivo.some((w) => doFilme.has(w))) return null;
+  return `o título gravado no arquivo é "${t.slice(0, 60)}" e o filme é "${(info.titulos || [])[0] || ''}"`;
 }
 
 // 'ok' | 'errado' | 'nao_verificado'  (só "errado" impede o vídeo de abrir)
@@ -475,10 +500,23 @@ async function veredito({ u, i, t }, rtConhecido) {
   if (!TMDB_KEY) return { status: 'nao_verificado' };
   let r;
   try {
-    const [rt, dur] = await Promise.all([rtConhecido !== undefined ? rtConhecido : runtimeMin(i, t), duracaoArquivo(u)]);
-    if (rt && dur) {
-      const folga = Math.max(rt * TOL, TOL_MIN);
-      r = { status: Math.abs(dur - rt) <= folga ? 'ok' : 'errado', tmdbMin: rt, arquivoMin: Math.round(dur) };
+    const [info, arq] = await Promise.all([infoTMDB(i, t).catch(() => null), duracaoArquivo(u)]);
+    const rt = info ? info.min : (rtConhecido || null);
+    const dur = arq && arq.min;
+    const tit = t === 'movie' && arq ? checarTituloGravado(arq.titulo, info) : null;
+    const kbps = dur && arq.total ? (arq.total * 8) / (dur * 60) / 1000 : null;
+    if (tit) {
+      r = { status: 'errado', por: 'título gravado no arquivo', texto: tit };
+    } else if (kbps !== null && dur > 20 && kbps < MIN_KBPS) {
+      r = { status: 'errado', por: 'tamanho do arquivo', texto: `só ${Math.round(arq.total / 1048576)} MB para ${Math.round(dur)} min: pequeno demais, provavelmente não é o filme` };
+    } else if (rt && dur) {
+      const folga = Math.max(rt * (t === 'series' ? TOL * 1.5 : TOL), TOL_MIN);
+      if (Math.abs(dur - rt) > folga) {
+        r = { status: 'errado', tmdbMin: rt, arquivoMin: Math.round(dur) };
+      } else {
+        const ext = await autenticidadeDoLink(u, i); // duração bate: confirma pelo reconhecimento do arquivo
+        r = ext.status === 'errado' ? ext : { status: 'ok', tmdbMin: rt, arquivoMin: Math.round(dur) };
+      }
     } else {
       const ext = dur ? null : await autenticidadeDoLink(u, i); // duração ilegível: pergunta ao site externo
       if (ext && ext.status !== 'nao_verificado') r = ext;
@@ -669,17 +707,18 @@ function bloquearStream(s, m, imdb) {
 }
 
 // ---------- addons de origem ----------
-async function streamsDe(base, tipo, id) {
+async function streamsDe(base, tipo, id, nome, falhas) {
   try {
     const r = await fetch(`${base}/stream/${tipo}/${encodeURIComponent(id)}.json`, {
       headers: { 'User-Agent': UA, Accept: 'application/json' },
       signal: AbortSignal.timeout(15000),
     });
-    if (!r.ok) return [];
+    if (!r.ok) { if (falhas) falhas.push(`${nome}: HTTP ${r.status}`); console.error('origem HTTP', r.status, base); return []; }
     const j = await r.json();
     return Array.isArray(j.streams) ? j.streams : [];
   } catch (e) {
     console.error('origem falhou:', base, e && e.message);
+    if (falhas) falhas.push(`${nome}: ${(e && e.message) || 'erro'}`);
     return [];
   }
 }
@@ -859,10 +898,11 @@ export default {
         const id = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
         const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
-        const listas = await Promise.all(origens.lista.map((a) => streamsDe(a.u, tipo, id)));
+        const falhas = [];
+        const listas = await Promise.all(origens.lista.map((a) => streamsDe(a.u, tipo, id, a.n, falhas)));
         const itens = [];
         origens.lista.forEach((a, k) => listas[k].forEach((s) => itens.push({ s, origem: a.n })));
-        const log = [];
+        const log = falhas.map((f) => `[falhou] ${f}`);
         let streams;
         if (TMDB_KEY && SECRET) {
           const t0 = Date.now();
