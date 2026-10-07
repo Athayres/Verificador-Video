@@ -1,3 +1,18 @@
+// ==========================================
+// PREENCHA AQUI COM OS DADOS ORIGINAIS DO SEU ADDON
+// ==========================================
+const CONFIG_ADDON = {
+  id: 'org.stremio.seuaddonoriginal',           // Coloque o ID original do seu addon
+  version: '1.0.0',
+  name: 'Nome Original do Seu Addon',           // Coloque o nome original aqui
+  description: 'Sua descrição original aqui',   // Coloque a descrição original aqui
+  logo: 'https://exemplo.com/seu-logo.png',     // Cole a URL do seu logo aqui (ou deixe vazio se não usar)
+  types: ['movie', 'series'],
+  catalogs: [],
+  resources: ['stream'],
+  idPrefixes: ['tt']
+};
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -13,24 +28,25 @@ export default {
       });
     }
 
-    // 1. Rota da Tela de Configuração (Garante que exiba a página com os 3 botões)
+    // 1. Rota da Tela de Configuração com os 3 botões
     if (url.pathname === '/' || url.pathname === '/configure' || url.pathname === '') {
       return new Response(getHtmlConfigPage(url.host), {
         headers: { 'Content-Type': 'text/html;charset=UTF-8' }
       });
     }
 
-    // 2. Rota do Manifesto do Stremio
+    // 2. Rota do Manifesto do Stremio (Usa os seus dados do topo)
     if (url.pathname === '/manifest.json') {
       const manifest = {
-        id: 'org.stremio.addonfiltrado',
-        version: '1.0.0',
-        name: 'Addon Filtrado (Stremio)',
-        description: 'Remove automaticamente da lista streams com duração ou conteúdo incorreto.',
-        types: ['movie', 'series'],
-        catalogs: [],
-        resources: ['stream'],
-        idPrefixes: ['tt']
+        id: CONFIG_ADDON.id,
+        version: CONFIG_ADDON.version,
+        name: CONFIG_ADDON.name,
+        description: CONFIG_ADDON.description,
+        logo: CONFIG_ADDON.logo,
+        types: CONFIG_ADDON.types,
+        catalogs: CONFIG_ADDON.catalogs,
+        resources: CONFIG_ADDON.resources,
+        idPrefixes: CONFIG_ADDON.idPrefixes
       };
       return new Response(JSON.stringify(manifest), {
         headers: {
@@ -71,7 +87,7 @@ export default {
 };
 
 /**
- * HTML limpo e garantido com os 3 botões
+ * Gera a página HTML de configuração com os 3 botões
  */
 function getHtmlConfigPage(host) {
   const stremioInstallUrl = `stremio://${host}/manifest.json`;
@@ -83,7 +99,7 @@ function getHtmlConfigPage(host) {
   <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Addon Filtrado - Stremio</title>
+    <title>${CONFIG_ADDON.name} - Configuração</title>
     <style>
       body {
         background-color: #121212;
@@ -159,8 +175,8 @@ function getHtmlConfigPage(host) {
   </head>
   <body>
     <div class="card">
-      <h1>Addon Filtrado</h1>
-      <p>Remove automaticamente da lista os arquivos com durações ou conteúdos incorretos.</p>
+      <h1>${CONFIG_ADDON.name}</h1>
+      <p>${CONFIG_ADDON.description}</p>
       
       <a href="${stremioInstallUrl}" class="btn btn-app">Instalar no App (Desktop/Mobile)</a>
       <a href="${stremioWebUrl}" target="_blank" class="btn btn-web">Instalar na Versão Web</a>
