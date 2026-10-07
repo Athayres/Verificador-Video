@@ -1,11 +1,12 @@
 // ==========================================
-// CONFIGURAÇÃO DO SEU ADDON
+// PREENCHA AQUI COM OS DADOS ORIGINAIS DO SEU ADDON
 // ==========================================
 const CONFIG_ADDON = {
-  id: 'org.stremio.seuaddonoriginal',           // Substitua pelo seu ID original
+  id: 'org.stremio.seuaddonoriginal',           // Coloque o ID original do seu addon
   version: '1.0.0',
-  name: 'Nome Original do Seu Addon',           // Substitua pelo seu nome original
-  description: 'Sua descrição original aqui',   // Substitua pela sua descrição original
+  name: 'Nome Original do Seu Addon',           // Coloque o nome original aqui
+  description: 'Sua descrição original aqui',   // Coloque a descrição original aqui
+  logo: 'https://exemplo.com/seu-logo.png',     // Cole a URL do seu logo original aqui
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -102,10 +103,20 @@ async function streamsDe(base, tipo, id) {
   }
 }
 
-// Lógica de validação e remoção de streams incorretos
-async function verificarStreamValido(stream, id) {
+// Filtro robusto que remove completamente os streams inválidos
+async function filtrarStreamsInvalidos(streams, id) {
+  if (!Array.isArray(streams) || streams.length === 0) return [];
+  const checks = streams.map(async (stream) => {
+    const valid = await verificarDuracaoOuConteudo(stream, id);
+    return { stream, valid };
+  });
+  const results = await Promise.all(checks);
+  return results.filter(r => r.valid).map(r => r.stream);
+}
+
+async function verificarDuracaoOuConteudo(stream, imdbId) {
   try {
-    // Insira sua regra de validação aqui. Retorne `false` para apagar o stream da lista.
+    // Insira aqui sua regra de validação. Retorne `false` para remover o stream da lista.
     if (stream.title && stream.title.toLowerCase().includes("errado")) {
       return false;
     }
@@ -126,145 +137,242 @@ function json(obj, status = 200) {
   });
 }
 
-// Gera o logo diretamente no Worker
-function gerarLogoSvg() {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
-    <rect width="512" height="512" rx="110" fill="#121212"/>
-    <circle cx="256" cy="256" r="170" fill="none" stroke="#e50914" stroke-width="28"/>
-    <polygon points="205,165 345,256 205,347" fill="#ffffff"/>
-  </svg>`;
-  return new Response(svg, {
-    headers: {
-      'Content-Type': 'image/svg+xml; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'public, max-age=86400'
-    }
-  });
-}
+function getHtmlConfigPage(host) {
+  const workerBaseUrl = `https://${host}`;
 
-function paginaConfig() {
-  const html = `<!DOCTYPE html>
-<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${CONFIG_ADDON.name} - Configuração</title>
-<style>
-body{font-family:system-ui,Arial,sans-serif;background:#121212;color:#fff;padding:20px;display:flex;justify-content:center;align-items:center;min-height:90vh;margin:0}
-.box{max-width:440px;width:100%;background:#1e1e1e;padding:25px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.6)}
-input{width:100%;padding:12px;margin:8px 0;background:#2a2a2a;border:1px solid #444;color:#fff;border-radius:6px;box-sizing:border-box;font:inherit}
-button{background:#e50914;color:#fff;border:0;padding:12px;width:100%;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;margin-top:8px}
-button.sec{background:#2d2d2d;border:1px solid #444}
-button.sec:hover{background:#3d3d3d}
-button.copy{background:#2563eb}
-p{color:#aaa;font-size:13px;line-height:1.4}
-#msg{color:#ffb74d;font-size:13px;min-height:18px;margin-top:6px}
-.btn-group{display:flex;flex-direction:column;gap:8px;margin-top:10px}
-</style></head><body><div class="box">
-<h2 style="text-align:center;color:#e50914;margin-top:0">${CONFIG_ADDON.name}</h2>
-<p>Entre com a sua conta do Stremio para ler automaticamente os seus addons instalados e aplicar os filtros.</p>
-<input type="email" id="email" placeholder="E-mail do Stremio" autocomplete="username">
-<input type="password" id="senha" placeholder="Senha" autocomplete="current-password">
-<button onclick="entrar()">Entrar e Gerar Link</button>
-<div id="msg"></div>
-<div id="resultado" style="display:none;margin-top:20px">
-<p style="color:#4ade80"><b>Pronto!</b> Escolha uma das opções abaixo para instalar:</p>
-<input type="text" id="link" readonly onclick="this.select()" style="font-size:11px;color:#888">
-<div class="btn-group">
-<button onclick="instalarApp()">Instalar no App (Stremio)</button>
-<button class="sec" onclick="instalarWeb()">Instalar na Versão Web</button>
-<button class="copy" onclick="copiar()">Copiar Link do Manifesto</button>
-</div>
-</div></div>
-<script>
-var caminho='';
-function msg(t){document.getElementById('msg').textContent=t}
-function b64u(s){return btoa(unescape(encodeURIComponent(s))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '')}
-function copiar(){var c=document.getElementById('link');c.select();document.execCommand('copy');msg('Link copiado para a área de transferência!');}
-function instalarApp(){window.location.href='stremio://'+caminho}
-function instalarWeb(){window.open('https://web.stremio.com/#/addons?addon='+encodeURIComponent(location.protocol+'//'+caminho),'_blank')}
-async function entrar(){
-  msg('Autenticando...');
-  try{
-    var r=await fetch('https://api.strem.io/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({type:'Login',email:document.getElementById('email').value.trim(),password:document.getElementById('senha').value,facebook:false})});
-    var j=await r.json();
-    if(!j.result||!j.result.authKey){msg('Login falhou: confira e-mail e senha.');return}
-    caminho=location.host+'/'+b64u(JSON.stringify({k:j.result.authKey}))+'/manifest.json';
-    document.getElementById('link').value=location.protocol+'//'+caminho;
-    document.getElementById('resultado').style.display='block';
-    msg('');
-  }catch(e){msg('Erro: '+e.message)}
-}
-</script></body></html>`;
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return `<!DOCTYPE html>
+  <html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${CONFIG_ADDON.name} - Configuração</title>
+    <style>
+      body {
+        background-color: #121212;
+        color: #ffffff;
+        font-family: Arial, sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+      }
+      .card {
+        background: #1e1e1e;
+        padding: 30px;
+        border-radius: 12px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        max-width: 440px;
+        width: 100%;
+        text-align: center;
+      }
+      h1 {
+        color: #e50914;
+        margin-bottom: 10px;
+        font-size: 22px;
+      }
+      p {
+        color: #b3b3b3;
+        font-size: 14px;
+        margin-bottom: 20px;
+        line-height: 1.4;
+      }
+      input {
+        width: 100%;
+        padding: 12px;
+        margin: 8px 0;
+        background: #2a2a2a;
+        border: 1px solid #444;
+        color: #fff;
+        border-radius: 6px;
+        box-sizing: border-box;
+        font: inherit;
+      }
+      .btn {
+        display: block;
+        width: 100%;
+        padding: 12px;
+        margin-top: 10px;
+        border-radius: 6px;
+        font-weight: bold;
+        font-size: 14px;
+        text-decoration: none;
+        border: none;
+        cursor: pointer;
+        box-sizing: border-box;
+        transition: background 0.2s;
+      }
+      .btn-app { background-color: #e50914; color: #fff; }
+      .btn-app:hover { background-color: #b20710; }
+      
+      .btn-web { background-color: #2d2d2d; color: #fff; border: 1px solid #444; }
+      .btn-web:hover { background-color: #3d3d3d; }
+      
+      .btn-copy { background-color: #2563eb; color: #fff; }
+      .btn-copy:hover { background-color: #1d4ed8; }
+
+      .link-box {
+        background: #121212;
+        padding: 10px;
+        border-radius: 6px;
+        font-size: 11px;
+        color: #888;
+        word-break: break-all;
+        margin-top: 15px;
+        border: 1px solid #333;
+        text-align: left;
+      }
+      #toast {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #4ade80;
+        display: none;
+      }
+      #msg { color: #ffb74d; font-size: 13px; min-height: 18px; margin-top: 6px; }
+      .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>${CONFIG_ADDON.name}</h1>
+      <p>${CONFIG_ADDON.description}</p>
+      <p style="font-size:12px; color:#aaa;">Entre com sua conta do Stremio para autenticar e carregar seus addons de stream instalados automaticamente.</p>
+      
+      <input type="email" id="email" placeholder="E-mail do Stremio" autocomplete="username">
+      <input type="password" id="senha" placeholder="Senha" autocomplete="current-password">
+      <button onclick="entrar()" class="btn btn-app">Entrar e Gerar Link</button>
+      <div id="msg"></div>
+
+      <div id="resultado" style="display:none; margin-top:15px;">
+        <div class="link-box" id="manifestLink"></div>
+        <div class="btn-group">
+          <button onclick="instalarApp()" class="btn btn-app">Instalar no App (Desktop/Mobile)</button>
+          <button onclick="instalarWeb()" class="btn btn-web">Instalar na Versão Web</button>
+          <button onclick="copiarLink()" class="btn btn-copy">Copiar Link do Manifesto</button>
+        </div>
+        <div id="toast">Link copiado com sucesso!</div>
+      </div>
+    </div>
+
+    <script>
+      const workerUrl = "${workerBaseUrl}";
+      var caminho = '';
+
+      function msg(t) { document.getElementById('msg').textContent = t; }
+      function b64u(s) { return btoa(unescape(encodeURIComponent(s))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, ''); }
+
+      async function entrar() {
+        msg('Autenticando...');
+        try {
+          const r = await fetch('https://api.strem.io/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ type: 'Login', email: document.getElementById('email').value.trim(), password: document.getElementById('senha').value, facebook: false })
+          });
+          const j = await r.json();
+          if (!j.result || !j.result.authKey) { msg('Login falhou: verifique e-mail e senha.'); return; }
+          
+          caminho = workerUrl + '/' + b64u(JSON.stringify({ k: j.result.authKey })) + '/manifest.json';
+          document.getElementById('manifestLink').innerText = caminho;
+          document.getElementById('resultado').style.display = 'block';
+          msg('');
+        } catch(e) { msg('Erro: ' + e.message); }
+      }
+
+      function instalarApp() {
+        window.location.href = 'stremio://' + caminho.replace('https://', '');
+      }
+
+      function instalarWeb() {
+        window.open('https://web.stremio.com/#/addons?addon=' + encodeURIComponent(caminho), '_blank');
+      }
+
+      function copiarLink() {
+        navigator.clipboard.writeText(caminho).then(() => {
+          const toast = document.getElementById('toast');
+          toast.style.display = 'block';
+          setTimeout(() => { toast.style.display = 'none'; }, 3000);
+        });
+      }
+    </script>
+  </body>
+  </html>`;
 }
 
 export default {
   async fetch(request, env, ctx) {
     try {
-      if (request.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS' } });
-      }
-      
       const url = new URL(request.url);
+
+      // Tratar requisições OPTIONS (CORS)
+      if (request.method === 'OPTIONS') {
+        return new Response(null, {
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS',
+            'Access-Control-Allow-Headers': '*'
+          }
+        });
+      }
+
       const partes = url.pathname.split('/').filter(Boolean);
       const base = url.origin;
-      
+
       if (!partes.length) return Response.redirect(`${url.origin}/configure`, 302);
-      
-      // Rota para servir o logo gerado pelo próprio Worker
-      if (url.pathname === '/logo' || url.pathname === '/logo.png') {
-        return gerarLogoSvg();
-      }
-      
-      const RESERVADOS = ['configure', 'manifest.json', 'stream', 'logo'];
+
+      const RESERVADOS = ['configure', 'manifest.json', 'stream'];
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift();
-      
-      if (partes[0] === 'configure') return paginaConfig();
+
+      // 1. Rota da Tela de Configuração
+      if (partes[0] === 'configure' || url.pathname === '/' || url.pathname === '') {
+        return new Response(getHtmlConfigPage(url.hostname), {
+          headers: { 'Content-Type': 'text/html;charset=UTF-8' }
+        });
+      }
+
+      // 2. Rota do Manifesto do Stremio (Usa o CONFIG_ADDON original)
       if (partes[0] === 'manifest.json') {
-        return json({
+        const manifest = {
           id: CONFIG_ADDON.id,
           version: CONFIG_ADDON.version,
           name: CONFIG_ADDON.name,
           description: CONFIG_ADDON.description,
-          logo: `${base}/logo`,
-          resources: CONFIG_ADDON.resources,
+          logo: CONFIG_ADDON.logo,
           types: CONFIG_ADDON.types,
-          idPrefixes: CONFIG_ADDON.idPrefixes,
           catalogs: CONFIG_ADDON.catalogs,
+          resources: CONFIG_ADDON.resources,
+          idPrefixes: CONFIG_ADDON.idPrefixes,
           behaviorHints: { configurable: true }
-        });
+        };
+        return json(manifest);
       }
 
+      // 3. Rota de Streams (Lê addons da conta via meta, busca em paralelo e filtra)
       if (partes[0] === 'stream') {
-        const tipo = decodeURIComponent(partes[1] || '');
+        const tipo = decodeURIComponent(pathParts[1] || partes[1] || '');
         const id = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
-        
+
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) {
           return json({ streams: [] });
         }
 
-        // Lê os addons de stream instalados na conta do Stremio automaticamente
+        // Pega os addons de stream instalados na conta do Stremio automaticamente
         const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
-        
-        // Busca os streams em paralelo
+
+        // Busca streams de todos os provedores em paralelo
         const listas = await Promise.all(origens.map((a) => streamsDe(a.u, tipo, id)));
         const itensBrutos = [];
         origens.forEach((a, k) => listas[k].forEach((s) => itensBrutos.push(s)));
 
-        // Aplica o filtro e remove completamente os streams inválidos
-        const promessasValidacao = itensBrutos.map(async (stream) => {
-          const valido = await verificarStreamValido(stream, id);
-          return { stream, valido };
-        });
-
-        const resultados = await Promise.all(promessasValidacao);
-        const streamsValidos = resultados.filter((r) => r.valido).map((r) => r.stream);
+        // Aplica o filtro robusto (.filter) para remover completamente os streams inválidos
+        const streamsValidos = await filtrarStreamsInvalidos(itensBrutos, id);
 
         return json({ streams: streamsValidos });
       }
 
-      return json({ erro: 'não encontrado' }, 404);
-    } catch (e) {
+      return new Response('Página não encontrada', { status: 404 });
+    } catch (error) {
       return json({ streams: [] }, 500);
     }
-  },
+  }
 };
