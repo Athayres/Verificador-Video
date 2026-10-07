@@ -1,25 +1,22 @@
 /**
  * Verificador de Duração – addon Stremio para Cloudflare Workers
- * Adaptado do verificador.js (Node/Render). Mesma lógica:
  *  1. O Stremio pede os streams a este addon (/stream/...).
- *  2. Ele busca a lista nos addons de origem (UPSTREAM_URL) e reescreve cada link direto (http/https)
- *     para apontar para ESTE Worker (/play/...). Torrents e outros tipos passam sem alteração.
- *  3. Quando você ESCOLHE um link, o Stremio chama /play/...: o Worker lê a duração do vídeo e compara
- *     com o runtime do TMDB (pelo tt).
- *       - bate (ou não deu para ler) -> redireciona para o link original e o vídeo toca
- *       - não bate                   -> responde erro e o vídeo NÃO abre
+ *  2. Ele lê SOZINHO a lista de addons da conta do Stremio (login em /configure) e busca os streams só nos
+ *     addons que têm "stream". Ficam de fora: este próprio verificador, o Controle de Impróprios (guia dos pais)
+ *     e os addons que só têm catálogo/metadados.
+ *  3. Cada link direto (http/https) é reescrito para apontar para ESTE Worker (/play/...). Torrents passam sem alteração.
+ *  4. A lista devolvida ao Stremio traz SÓ os vídeos que passaram no teste: o que o teste reprova (duração diferente
+ *     do TMDB, arquivo reconhecido como outro título, nome do arquivo com outro filme/episódio, título não lançado)
+ *     é REMOVIDO da lista. O que não deu para medir continua aparecendo e, se for escolhido, é conferido em /play/.
+ *     Instale este addon por último na ordem dos addons.
  *
- * DIFERENÇA para o Render: o Worker não executa programas (não existe ffprobe). A duração é lida do
- * cabeçalho do arquivo por pedidos Range (MP4/MOV pelo átomo moov/mvhd; MKV/WebM pelo Info/Duration).
- * HLS (.m3u8) também é medido (soma dos trechos). O que não dá para medir (torrent, TS, AVI, servidor sem Range...)
- * é conferido só pelo NOME do arquivo (ano do filme e temporada/episódio) e, se nada indicar erro, toca normalmente.
- *
- * Os addons de origem NÃO são digitados: na página /configure você entra com a sua conta do Stremio, e o Worker
- * lê a lista de addons instalados na conta e usa só os que têm "stream" (ignora o próprio Verificador).
+ * A duração é lida do cabeçalho do arquivo por pedidos Range (MP4/MOV pelo átomo moov/mvhd; MKV/WebM pelo
+ * Info/Duration; HLS pela soma dos trechos). O que não dá para medir é conferido pelo NOME do arquivo e, se nada
+ * indicar erro, passa.
  *
  * Variáveis (Settings > Variables and Secrets) OU entradas de mesmo nome no KV ligado como "KV":
- *   TMDB_KEY (obrigatória)   SECRET (recomendada; sem ela usa a TMDB_KEY)
- *   UPSTREAM_URL (opcional: links extras, separados por espaço ou vírgula)   PUBLIC_URL (opcional)
+ *   TMDB_KEY (obrigatória)   SECRET (recomendada; sem ela usa a TMDB_KEY)   PUBLIC_URL (opcional)
+ *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
  *   TOLERANCIA (padrão 0.10)   TOLERANCIA_MIN (padrão 5)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  */
 const SELF_ID = 'community.verificador.duracao';
@@ -27,8 +24,11 @@ const STREMIO_API = 'https://api.strem.io/api';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const TTL = 24 * 3600 * 1000;
 
+// addons que NUNCA entram como origem de vídeos (além dos que não têm "stream")
+const RE_PROPRIO = /verificador de dura[cç][aã]o/i;
+const RE_PARENTAL = /controle de impr[oó]prios?|guia dos pais|parents?[ _-]?guide|parental|classifica[cç][aã]o indicativa|content[ _-]?(advisory|rating|warning)|age[ _-]?(rating|gate|block)/i;
+
 let TMDB_KEY = '';
-let UPSTREAMS = [];
 let PUBLIC_URL = '';
 let SECRET = '';
 let KV = null;
@@ -38,7 +38,7 @@ let TIMEOUT = 8000;
 let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
 let OS_KEY = '';
-let BLOQUEAR = true;
+let MODO = 'ocultar'; // ocultar | marcar | bloquear
 
 async function carregarConfig(env) {
   KV = env.KV || null;
@@ -48,8 +48,6 @@ async function carregarConfig(env) {
     return v;
   };
   TMDB_KEY = await ler('TMDB_KEY');
-  UPSTREAMS = (await ler('UPSTREAM_URL')).split(/[\s,]+/).filter(Boolean)
-    .map((u) => u.replace(/\/manifest\.json$/, '').replace(/\/+$/, ''));
   PUBLIC_URL = String(env.PUBLIC_URL || '').trim().replace(/\/+$/, '');
   SECRET = (await ler('SECRET')) || TMDB_KEY;
   TOL = Number(env.TOLERANCIA || 0.10);
@@ -58,7 +56,8 @@ async function carregarConfig(env) {
   ORCAMENTO_MS = Number(env.VERIFICACAO_MS || 8000);
   MAX_SONDAS = Number(env.MAX_SONDAS || 12);
   OS_KEY = await ler('OPENSUBTITLES_KEY');
-  BLOQUEAR = String(env.BLOQUEAR_INCORRETOS || '1') !== '0';
+  const modo = String((await ler('INCORRETOS')) || '').toLowerCase();
+  MODO = ['ocultar', 'marcar', 'bloquear'].includes(modo) ? modo : (String(env.BLOQUEAR_INCORRETOS || '') === '0' ? 'marcar' : 'ocultar');
 }
 
 // ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
@@ -503,7 +502,8 @@ function lerConfigConta(b64) {
       .slice(0, 40)
       .map((x) => ({ n: String(x.n || hostDe(x.u)).slice(0, 60), u: limparUrl(x.u), types: Array.isArray(x.t) ? x.t : [], prefixes: Array.isArray(x.p) ? x.p : [] }));
     const k = typeof j.k === 'string' ? j.k : '';
-    return k || a.length ? { k, a } : null;
+    const fora = (Array.isArray(j.x) ? j.x : []).filter((u) => typeof u === 'string').slice(0, 80).map(limparUrl);
+    return k || a.length ? { k, a, x: fora } : null;
   } catch { return null; }
 }
 const limparUrl = (u) => String(u || '').trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, '');
@@ -516,6 +516,16 @@ function recursoStream(m) {
     else if (r && r.name === 'stream') return { types: r.types || m.types || [], prefixes: r.idPrefixes || m.idPrefixes || [] };
   }
   return null;
+}
+
+// decide se o addon pode ser origem de vídeos: { rec } se sim, { ignorar: motivo } se não
+function avaliarAddon(m) {
+  if (!m) return { ignorar: 'inválido' };
+  if (m.id === SELF_ID || RE_PROPRIO.test(m.name || '')) return { ignorar: 'é o próprio verificador' };
+  if (RE_PARENTAL.test([m.id, m.name, m.description].join(' '))) return { ignorar: 'controle de impróprios' };
+  const rec = recursoStream(m);
+  if (!rec) return { ignorar: 'sem stream (só catálogo/metadados)' };
+  return { rec };
 }
 
 const cacheContas = new Map();
@@ -533,9 +543,10 @@ async function addonsDaConta(authKey) {
   if (!j.result || !Array.isArray(j.result.addons)) throw new Error('sessão do Stremio inválida ou expirada (gere o link de novo em /configure)');
   const lista = [];
   for (const a of j.result.addons) {
-    if (!a || !a.manifest || a.manifest.id === SELF_ID || !/^https?:/i.test(a.transportUrl || '')) continue;
-    const rec = recursoStream(a.manifest);
-    if (!rec) continue; // só quem tem stream
+    if (!a || !a.manifest || !/^https?:/i.test(a.transportUrl || '')) continue;
+    const av = avaliarAddon(a.manifest);
+    if (av.ignorar) continue; // fora: o próprio verificador, controle de impróprios e quem não tem stream
+    const rec = av.rec;
     lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
   }
   if (cacheContas.size >= 200) cacheContas.clear();
@@ -543,7 +554,7 @@ async function addonsDaConta(authKey) {
   return lista;
 }
 
-// addons de origem para este pedido: os da conta (filtrados por tipo e prefixo do id) + UPSTREAM_URL, se houver
+// addons de origem para este pedido: os da conta (filtrados por tipo e prefixo do id)
 async function listaDeOrigens(cfgB64, host, tipo, id) {
   let lista = [];
   let erro = null;
@@ -554,10 +565,12 @@ async function listaDeOrigens(cfgB64, host, tipo, id) {
       try { lista = lista.concat(await addonsDaConta(cfg.k)); } catch (e) { erro = e.message; console.error('[conta Stremio]', e.message); }
     }
   }
+  const fora = new Set(cfg ? cfg.x : []);
   lista = lista
+    .filter((a) => !fora.has(a.u))                                        // desmarcados na /configure
+    .filter((a) => !RE_PROPRIO.test(a.n) && !RE_PARENTAL.test(a.n))      // links antigos que ainda os continham
     .filter((a) => !a.types.length || !tipo || a.types.includes(tipo))
     .filter((a) => !a.prefixes.length || !id || a.prefixes.some((p) => id.startsWith(p)));
-  for (const u of UPSTREAMS) lista.push({ n: hostDe(u), u, types: [], prefixes: [] });
   const vistos = new Set();
   const final = lista
     .filter((a) => hostDe(a.u) !== host)          // nunca chama a si mesmo
@@ -682,9 +695,9 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.7.0',
+    version: '1.8.0',
     name: 'Verificador de Duração',
-    description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
+    description: 'Lê os addons de vídeo da sua conta e mostra só os streams que passam no teste de duração (TMDB). Instale por último.',
     logo: `${base}/check_tempo.png`,
     resources: ['stream'],
     types: ['movie', 'series'],
@@ -726,18 +739,12 @@ label{display:block;padding:6px 0;font-size:14px}
 <img src="/check_tempo.png" alt="" style="width:72px;height:72px;display:block;margin:0 auto 8px">
 <h2 style="text-align:center;margin:6px 0 12px">Verificador de Duração</h2>
 <div id="passo1">
-<p>Entre com a sua conta do Stremio para escolher quais addons o verificador deve conferir. O e-mail e a senha vão direto para o Stremio, não passam por este servidor.</p>
+<p>Entre com a sua conta do Stremio. O verificador lê sozinho os addons de vídeo da conta. O e-mail e a senha vão direto para o Stremio, não passam por este servidor.</p>
 <input type="email" id="email" placeholder="E-mail do Stremio" autocomplete="username">
 <input type="password" id="senha" placeholder="Senha" autocomplete="current-password">
-<button onclick="entrar()">Entrar e listar meus addons</button>
+<button onclick="entrar()">Gerar link</button>
 </div>
 <div id="msg"></div>
-<div id="passo2" style="display:none">
-<p>Addons com <b>stream</b> encontrados na sua conta. Marque os que o verificador deve conferir:</p>
-<div id="lista"></div>
-<label><input type="checkbox" id="viva"> Também ler a minha conta a cada uso (pega addons novos sozinho, mas o link passa a conter o acesso à conta)</label>
-<button onclick="gerar()">Gerar link</button>
-</div>
 <div id="resultado" style="display:none">
 <p>Instale o link abaixo. <b>Depois você pode desinstalar os addons marcados no Stremio</b>: o verificador guarda os endereços deles no próprio link, e assim os vídeos deles não aparecem duplicados.</p>
 <input type="text" id="link" readonly onclick="this.select()">
@@ -746,7 +753,10 @@ label{display:block;padding:6px 0;font-size:14px}
 <button class="sec" onclick="instalarWeb()">Instalar no Stremio Web</button>
 </div></div>
 <script>
-var caminho='', AUTH='', LISTA=[];
+var SELF_ID=${JSON.stringify(SELF_ID)};
+var RE_PROPRIO=new RegExp(${JSON.stringify(RE_PROPRIO.source)},'i');
+var RE_PARENTAL=new RegExp(${JSON.stringify(RE_PARENTAL.source)},'i');
+var caminho='', AUTH='';
 function msg(t){document.getElementById('msg').textContent=t}
 function b64u(s){return btoa(unescape(encodeURIComponent(s))).split('+').join('-').split('/').join('_').split('=').join('')}
 function copiar(){var c=document.getElementById('link');c.select();document.execCommand('copy');msg('Link copiado!')}
@@ -760,6 +770,13 @@ function temStream(m){
     if(r&&r.name==='stream')return{t:r.types||m.types||[],p:r.idPrefixes||m.idPrefixes||[]};
   }
   return null;
+}
+function avaliar(m){
+  if(m.id===SELF_ID||RE_PROPRIO.test(m.name||''))return{self:true};
+  if(RE_PARENTAL.test([m.id,m.name,m.description].join(' ')))return{ign:'controle de impróprios'};
+  var rec=temStream(m);
+  if(!rec)return{ign:'só catálogo/metadados, sem vídeos'};
+  return{rec:rec};
 }
 function limpar(u){
   u=String(u||'').trim();
@@ -780,38 +797,21 @@ async function entrar(){
     AUTH=j.result.authKey;
     var c=await api('addonCollectionGet',{type:'AddonCollectionGet',authKey:AUTH,update:true});
     if(!c.result||!c.result.addons){msg('Não consegui ler a lista de addons da conta.');return}
-    LISTA=[];
+    var sel=[];
     c.result.addons.forEach(function(a){
       var m=a.manifest||{};
-      if(m.id==='community.verificador.duracao'||!/^https?:/i.test(a.transportUrl||''))return;
-      var rec=temStream(m);
-      if(!rec)return;
-      LISTA.push({n:m.name||a.transportUrl,u:limpar(a.transportUrl),t:rec.t,p:rec.p});
+      if(!/^https?:/i.test(a.transportUrl||''))return;
+      var av=avaliar(m);
+      if(av.ign||av.self)return;
+      sel.push({n:m.name||a.transportUrl,u:limpar(a.transportUrl),t:av.rec.t,p:av.rec.p});
     });
-    var div=document.getElementById('lista');
-    div.textContent='';
-    LISTA.forEach(function(x,i){
-      var l=document.createElement('label');
-      var cb=document.createElement('input');cb.type='checkbox';cb.checked=true;cb.id='ad'+i;
-      l.appendChild(cb);
-      l.appendChild(document.createTextNode(' '+x.n));
-      div.appendChild(l);
-    });
+    var cfg={a:sel,k:AUTH};
+    caminho=location.host+'/'+b64u(JSON.stringify(cfg))+'/manifest.json';
+    document.getElementById('link').value=location.protocol+'//'+caminho;
     document.getElementById('passo1').style.display='none';
-    document.getElementById('passo2').style.display='block';
-    msg(LISTA.length?'Encontrei '+LISTA.length+' addon(s) com stream.':'Nenhum addon com stream encontrado na conta.');
+    document.getElementById('resultado').style.display='block';
+    msg('Pronto: '+sel.length+' addon(s) com stream. Copie o link ou instale direto.');
   }catch(e){msg('Erro: '+e.message)}
-}
-function gerar(){
-  var sel=[];
-  LISTA.forEach(function(x,i){if(document.getElementById('ad'+i).checked)sel.push({n:x.n,u:x.u,t:x.t,p:x.p})});
-  var cfg={a:sel};
-  if(document.getElementById('viva').checked)cfg.k=AUTH;
-  if(!sel.length&&!cfg.k){msg('Marque pelo menos um addon.');return}
-  caminho=location.host+'/'+b64u(JSON.stringify(cfg))+'/manifest.json';
-  document.getElementById('link').value=location.protocol+'//'+caminho;
-  document.getElementById('resultado').style.display='block';
-  msg('Pronto. Copie o link ou instale direto.');
 }
 </script></body></html>`;
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
@@ -849,7 +849,7 @@ export default {
         return json({
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
-          bloqueio: BLOQUEAR ? 'ligado (item marcado não toca)' : 'desligado (só avisa)',
+          reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
         });
       }
@@ -878,7 +878,8 @@ export default {
             const orcamento = Math.max(2500, Math.min(ORCAMENTO_MS, 12000 - (Date.now() - t0)));
             ver = await verificarLista(itens, id, tipo, rt, ctx, orcamento);
           }
-          streams = await Promise.all(itens.map(async (it) => {
+          let reprovados = 0;
+          streams = (await Promise.all(itens.map(async (it) => {
             let s = await reescrever(it.s, base, tipo, id);
             const v = ver.resultados.get(it);
             const nome = String(it.s.name || it.s.title || 'Stream').replace(/\s+/g, ' ').slice(0, 60);
@@ -905,11 +906,14 @@ export default {
               else if (nomeDoArquivo(it.s)) situacao += ` | nome "${nomeDoArquivo(it.s).slice(0, 70)}" sem sinais de erro`;
             }
             log.push(`[${it.origem}] ${nome} -> ${situacao}`);
-            if (marca) s = BLOQUEAR ? bloquearStream(it.s, marca, id.split(':')[0]) : marcarIncorreto(s, marca);
+            if (marca) {
+              reprovados++;
+              if (MODO === 'ocultar') return null; // só fica na lista quem passou no teste
+              s = MODO === 'bloquear' ? bloquearStream(it.s, marca, id.split(':')[0]) : marcarIncorreto(s, marca);
+            }
             return s;
-          }));
-          const incorretos = streams.filter((s) => String(s.name || '').startsWith(PREFIXO)).length;
-          console.log(`stream ${tipo} ${id}: ${streams.length} streams, TMDB ${rt || '?'} min, ${incorretos} incorretos`);
+          }))).filter(Boolean);
+          console.log(`stream ${tipo} ${id}: ${streams.length} na lista, TMDB ${rt || '?'} min, ${reprovados} reprovados (${MODO})`);
           for (const l of log) console.log('[verif]', id, l);
         } else {
           streams = itens.map((it) => it.s);
