@@ -1,12 +1,11 @@
 // ==========================================
-// SEUS DADOS ORIGINAIS DO ADDON (Preencha com os seus valores reais)
+// CONFIGURAÇÃO DO SEU ADDON
 // ==========================================
 const CONFIG_ADDON = {
   id: 'org.stremio.seuaddonoriginal',           // Substitua pelo seu ID original
   version: '1.0.0',
   name: 'Nome Original do Seu Addon',           // Substitua pelo seu nome original
   description: 'Sua descrição original aqui',   // Substitua pela sua descrição original
-  logo: 'https://exemplo.com/seu-logo.png',     // Substitua pela URL do seu logo original
   types: ['movie', 'series'],
   catalogs: [],
   resources: ['stream'],
@@ -127,6 +126,22 @@ function json(obj, status = 200) {
   });
 }
 
+// Gera o logo diretamente no Worker
+function gerarLogoSvg() {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+    <rect width="512" height="512" rx="110" fill="#121212"/>
+    <circle cx="256" cy="256" r="170" fill="none" stroke="#e50914" stroke-width="28"/>
+    <polygon points="205,165 345,256 205,347" fill="#ffffff"/>
+  </svg>`;
+  return new Response(svg, {
+    headers: {
+      'Content-Type': 'image/svg+xml; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=86400'
+    }
+  });
+}
+
 function paginaConfig() {
   const html = `<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -195,7 +210,12 @@ export default {
       
       if (!partes.length) return Response.redirect(`${url.origin}/configure`, 302);
       
-      const RESERVADOS = ['configure', 'manifest.json', 'stream'];
+      // Rota para servir o logo gerado pelo próprio Worker
+      if (url.pathname === '/logo' || url.pathname === '/logo.png') {
+        return gerarLogoSvg();
+      }
+      
+      const RESERVADOS = ['configure', 'manifest.json', 'stream', 'logo'];
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift();
       
       if (partes[0] === 'configure') return paginaConfig();
@@ -205,7 +225,7 @@ export default {
           version: CONFIG_ADDON.version,
           name: CONFIG_ADDON.name,
           description: CONFIG_ADDON.description,
-          logo: CONFIG_ADDON.logo,
+          logo: `${base}/logo`,
           resources: CONFIG_ADDON.resources,
           types: CONFIG_ADDON.types,
           idPrefixes: CONFIG_ADDON.idPrefixes,
