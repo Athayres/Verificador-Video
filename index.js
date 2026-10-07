@@ -11,6 +11,12 @@ const UPSTREAMS = []; // URLs de addons fixos opcionais (ex: ['https://outro-add
 // ==========================================
 const td = new TextDecoder();
 
+function bytesParaB64u(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 function b64uParaBytes(b64u) {
   let b64 = b64u.replace(/-/g, '+').replace(/_/g, '/');
   while (b64.length % 4) b64 += '=';
@@ -84,7 +90,7 @@ async function addonsDaConta(authKey) {
   for (const a of j.result.addons) {
     if (!a || !a.manifest || a.manifest.id === SELF_ID || !/^https?:/i.test(a.transportUrl || '')) continue;
     const rec = recursoStream(a.manifest);
-    if (!rec) continue; // Apenas addons que possuem o recurso "stream"
+    if (!rec) continue; 
     lista.push({ 
       n: a.manifest.name || hostDe(a.transportUrl), 
       u: limparUrl(a.transportUrl), 
@@ -123,7 +129,7 @@ async function listaDeOrigens(cfgB64, host, tipo, id) {
   
   const vistos = new Set();
   const final = lista
-    .filter((a) => hostDe(a.u) !== host) // Nunca chama a si mesmo em loop
+    .filter((a) => hostDe(a.u) !== host) 
     .filter((a) => !vistos.has(a.u) && vistos.add(a.u))
     .slice(0, 30);
     
@@ -141,16 +147,66 @@ export default {
     let cfgB64 = '';
     let startIndex = 0;
     
-    // Suporte opcional para extrair a config da URL (ex: /:config/manifest.json)
-    if (pathParts.length > 0 && pathParts[0] !== 'manifest.json' && pathParts[0] !== 'stream') {
+    // Extrai a config da URL se existir (ex: /:config/manifest.json ou /:config/configure)
+    if (pathParts.length > 0 && pathParts[0] !== 'manifest.json' && pathParts[0] !== 'configure' && pathParts[0] !== 'stream') {
       cfgB64 = pathParts[0];
       startIndex = 1;
     }
 
     const action = pathParts[startIndex];
 
-    // 1. Rota do Manifesto do Addon
-    if (action === 'manifest.json' || pathParts.length === 0) {
+    // 1. Página de Configuração (/configure)
+    if (action === 'configure' || (pathParts.length === 0 && !cfgB64)) {
+      const html = `<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <title>Configurar Stremio Multi-Addon Proxy</title>
+    <style>
+        body { font-family: sans-serif; background: #121212; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: #1e1e1e; padding: 30px; border-radius: 8px; width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+        h2 { margin-top: 0; color: #b52222; }
+        label { display: block; margin-bottom: 8px; font-size: 14px; }
+        input { width: 100%; padding: 10px; margin-bottom: 20px; background: #2a2a2a; border: 1px solid #444; color: #fff; border-radius: 4px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #b52222; border: none; color: #fff; font-weight: bold; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #d32f2f; }
+        .links { margin-top: 15px; word-break: break-all; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>Configurar Proxy</h2>
+        <label for="authKey">Chave Stremio (Auth Key):</label>
+        <input type="text" id="authKey" placeholder="Cole sua authKey do Stremio aqui">
+        <button onclick="gerarLink()">Gerar Link de Instalação</button>
+        <div id="resultado" class="links"></div>
+    </div>
+    <script>
+        function gerarLink() {
+            const authKey = document.getElementById('authKey').value.trim();
+            const configObj = { k: authKey, a: [] };
+            const jsonStr = JSON.stringify(configObj);
+            const bytes = new TextEncoder().encode(jsonStr);
+            let bin = '';
+            for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+            const b64u = btoa(bin).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+            
+            const proto = window.location.protocol === 'https:' ? 'stremio:' : 'http:';
+            const host = window.location.host;
+            const link = \`stremio://\${host}/\${b64u}/manifest.json\`;
+            
+            document.getElementById('resultado').innerHTML = \`<p>Link gerado com sucesso!</p><a href="\${link}" style="color: #4da6ff;">Instalar Addon no Stremio</a>\`;
+        }
+    </script>
+</body>
+</html>`;
+      return new Response(html, {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // 2. Rota do Manifesto do Addon
+    if (action === 'manifest.json' || (pathParts.length === 0 && cfgB64)) {
       const manifest = {
         id: SELF_ID,
         version: '1.0.0',
@@ -158,14 +214,15 @@ export default {
         description: 'Agregador dinâmico de addons do Stremio.',
         types: ['movie', 'series', 'anime'],
         resources: ['stream'],
-        idPrefixes: ['tt']
+        idPrefixes: ['tt'],
+        behaviorHints: { configurable: true }
       };
       return new Response(JSON.stringify(manifest), {
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
     }
 
-    // 2. Rota de Streams
+    // 3. Rota de Streams
     if (action === 'stream') {
       const tipo = pathParts[startIndex + 1];
       const idComExtensao = pathParts[startIndex + 2] || '';
@@ -179,7 +236,6 @@ export default {
 
       const { lista, erro } = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
       
-      // Realiza as requisições em paralelo para todos os addons filtrados
       const promessas = lista.map(async (origem) => {
         try {
           const res = await fetch(`${origem.u}/stream/${tipo}/${id}.json`, {
