@@ -497,7 +497,13 @@ function lerConfigConta(b64) {
   if (!b64) return null;
   try {
     const j = JSON.parse(td.decode(b64uParaBytes(b64)));
-    return j && typeof j.k === 'string' && j.k ? j : null;
+    if (!j || typeof j !== 'object') return null;
+    const a = (Array.isArray(j.a) ? j.a : [])
+      .filter((x) => x && typeof x.u === 'string' && /^https?:\/\//i.test(x.u))
+      .slice(0, 40)
+      .map((x) => ({ n: String(x.n || hostDe(x.u)).slice(0, 60), u: limparUrl(x.u), types: Array.isArray(x.t) ? x.t : [], prefixes: Array.isArray(x.p) ? x.p : [] }));
+    const k = typeof j.k === 'string' ? j.k : '';
+    return k || a.length ? { k, a } : null;
   } catch { return null; }
 }
 const limparUrl = (u) => String(u || '').trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, '');
@@ -543,7 +549,10 @@ async function listaDeOrigens(cfgB64, host, tipo, id) {
   let erro = null;
   const cfg = lerConfigConta(cfgB64);
   if (cfg) {
-    try { lista = await addonsDaConta(cfg.k); } catch (e) { erro = e.message; console.error('[conta Stremio]', e.message); }
+    lista = lista.concat(cfg.a); // lista gravada no próprio link (vale mesmo que o addon original seja desinstalado do Stremio)
+    if (cfg.k) {
+      try { lista = lista.concat(await addonsDaConta(cfg.k)); } catch (e) { erro = e.message; console.error('[conta Stremio]', e.message); }
+    }
   }
   lista = lista
     .filter((a) => !a.types.length || !tipo || a.types.includes(tipo))
@@ -673,7 +682,7 @@ async function reescrever(s, base, tipo, id) {
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.6.0',
+    version: '1.7.0',
     name: 'Verificador de Duração',
     description: 'Repassa os streams de outro addon e impede de abrir o vídeo cuja duração não bate com a do filme/episódio no TMDB.',
     logo: `${base}/check_tempo.png`,
@@ -706,46 +715,103 @@ function paginaConfig() {
 <title>Verificador de Duração</title>
 <style>
 body{font-family:system-ui,Arial,sans-serif;background:#111;color:#fff;padding:20px}
-.box{max-width:460px;margin:auto;background:#222;padding:20px;border-radius:10px}
-input{width:100%;padding:10px;margin:6px 0;background:#333;border:1px solid #444;color:#fff;border-radius:6px;box-sizing:border-box;font:inherit}
+.box{max-width:480px;margin:auto;background:#222;padding:20px;border-radius:10px}
+input[type=text],input[type=email],input[type=password]{width:100%;padding:10px;margin:6px 0;background:#333;border:1px solid #444;color:#fff;border-radius:6px;box-sizing:border-box;font:inherit}
 button{background:#e50914;color:#fff;border:0;padding:12px;width:100%;border-radius:6px;font-weight:700;font-size:15px;cursor:pointer;margin-top:8px}
 button.sec{background:#444}
 p{color:#aaa;font-size:13px;line-height:1.4}
+label{display:block;padding:6px 0;font-size:14px}
 #msg{color:#ffb74d;font-size:14px;min-height:18px}
 </style></head><body><div class="box">
 <img src="/check_tempo.png" alt="" style="width:72px;height:72px;display:block;margin:0 auto 8px">
 <h2 style="text-align:center;margin:6px 0 12px">Verificador de Duração</h2>
-<p>Entre com a sua conta do Stremio. O verificador lê a lista de addons instalados na conta e usa sozinho só os que têm <b>stream</b>. O e-mail e a senha vão direto para o Stremio, não passam por este servidor.</p>
+<div id="passo1">
+<p>Entre com a sua conta do Stremio para escolher quais addons o verificador deve conferir. O e-mail e a senha vão direto para o Stremio, não passam por este servidor.</p>
 <input type="email" id="email" placeholder="E-mail do Stremio" autocomplete="username">
 <input type="password" id="senha" placeholder="Senha" autocomplete="current-password">
-<button onclick="entrar()">Entrar e gerar link</button>
+<button onclick="entrar()">Entrar e listar meus addons</button>
+</div>
 <div id="msg"></div>
+<div id="passo2" style="display:none">
+<p>Addons com <b>stream</b> encontrados na sua conta. Marque os que o verificador deve conferir:</p>
+<div id="lista"></div>
+<label><input type="checkbox" id="viva"> Também ler a minha conta a cada uso (pega addons novos sozinho, mas o link passa a conter o acesso à conta)</label>
+<button onclick="gerar()">Gerar link</button>
+</div>
 <div id="resultado" style="display:none">
-<p>O link abaixo contém o acesso à sua conta: <b>não compartilhe</b>.</p>
+<p>Instale o link abaixo. <b>Depois você pode desinstalar os addons marcados no Stremio</b>: o verificador guarda os endereços deles no próprio link, e assim os vídeos deles não aparecem duplicados.</p>
 <input type="text" id="link" readonly onclick="this.select()">
 <button onclick="copiar()">Copiar link</button>
 <button class="sec" onclick="instalar()">Instalar no Stremio (app)</button>
 <button class="sec" onclick="instalarWeb()">Instalar no Stremio Web</button>
 </div></div>
 <script>
-var caminho='';
+var caminho='', AUTH='', LISTA=[];
 function msg(t){document.getElementById('msg').textContent=t}
 function b64u(s){return btoa(unescape(encodeURIComponent(s))).split('+').join('-').split('/').join('_').split('=').join('')}
 function copiar(){var c=document.getElementById('link');c.select();document.execCommand('copy');msg('Link copiado!')}
 function instalar(){window.location.href='stremio://'+caminho}
 function instalarWeb(){window.open('https://web.stremio.com/#/addons?addon='+encodeURIComponent(location.protocol+'//'+caminho),'_blank')}
+function temStream(m){
+  var rs=m.resources||[];
+  for(var i=0;i<rs.length;i++){
+    var r=rs[i];
+    if(r==='stream')return{t:m.types||[],p:m.idPrefixes||[]};
+    if(r&&r.name==='stream')return{t:r.types||m.types||[],p:r.idPrefixes||m.idPrefixes||[]};
+  }
+  return null;
+}
+function limpar(u){
+  u=String(u||'').trim();
+  var i=u.indexOf('/manifest.json');
+  if(i>=0)u=u.slice(0,i);
+  while(u.length&&u.charAt(u.length-1)==='/')u=u.slice(0,-1);
+  return u;
+}
+async function api(rota,corpo){
+  var r=await fetch('https://api.strem.io/api/'+rota,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corpo)});
+  return r.json();
+}
 async function entrar(){
   msg('Entrando...');
   try{
-    var r=await fetch('https://api.strem.io/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({type:'Login',email:document.getElementById('email').value.trim(),password:document.getElementById('senha').value,facebook:false})});
-    var j=await r.json();
+    var j=await api('login',{type:'Login',email:document.getElementById('email').value.trim(),password:document.getElementById('senha').value,facebook:false});
     if(!j.result||!j.result.authKey){msg('Login falhou: confira e-mail e senha.');return}
-    caminho=location.host+'/'+b64u(JSON.stringify({k:j.result.authKey}))+'/manifest.json';
-    document.getElementById('link').value=location.protocol+'//'+caminho;
-    document.getElementById('resultado').style.display='block';
-    msg('Pronto. Copie o link ou instale direto.');
+    AUTH=j.result.authKey;
+    var c=await api('addonCollectionGet',{type:'AddonCollectionGet',authKey:AUTH,update:true});
+    if(!c.result||!c.result.addons){msg('Não consegui ler a lista de addons da conta.');return}
+    LISTA=[];
+    c.result.addons.forEach(function(a){
+      var m=a.manifest||{};
+      if(m.id==='community.verificador.duracao'||!/^https?:/i.test(a.transportUrl||''))return;
+      var rec=temStream(m);
+      if(!rec)return;
+      LISTA.push({n:m.name||a.transportUrl,u:limpar(a.transportUrl),t:rec.t,p:rec.p});
+    });
+    var div=document.getElementById('lista');
+    div.textContent='';
+    LISTA.forEach(function(x,i){
+      var l=document.createElement('label');
+      var cb=document.createElement('input');cb.type='checkbox';cb.checked=true;cb.id='ad'+i;
+      l.appendChild(cb);
+      l.appendChild(document.createTextNode(' '+x.n));
+      div.appendChild(l);
+    });
+    document.getElementById('passo1').style.display='none';
+    document.getElementById('passo2').style.display='block';
+    msg(LISTA.length?'Encontrei '+LISTA.length+' addon(s) com stream.':'Nenhum addon com stream encontrado na conta.');
   }catch(e){msg('Erro: '+e.message)}
+}
+function gerar(){
+  var sel=[];
+  LISTA.forEach(function(x,i){if(document.getElementById('ad'+i).checked)sel.push({n:x.n,u:x.u,t:x.t,p:x.p})});
+  var cfg={a:sel};
+  if(document.getElementById('viva').checked)cfg.k=AUTH;
+  if(!sel.length&&!cfg.k){msg('Marque pelo menos um addon.');return}
+  caminho=location.host+'/'+b64u(JSON.stringify(cfg))+'/manifest.json';
+  document.getElementById('link').value=location.protocol+'//'+caminho;
+  document.getElementById('resultado').style.display='block';
+  msg('Pronto. Copie o link ou instale direto.');
 }
 </script></body></html>`;
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
