@@ -1,21 +1,22 @@
-/**
- * Addon Stremio para Cloudflare Workers
- * - Lê os addons de stream instalados na sua conta do Stremio automaticamente.
- * - Busca os streams de todos eles em paralelo.
- * - Filtra e remove completamente os streams incorretos/inválidos antes de enviar ao Stremio.
- */
-const SELF_ID = 'community.verificador.duracao';
+// ==========================================
+// SEUS DADOS ORIGINAIS DO ADDON (Preencha com os seus valores reais)
+// ==========================================
+const CONFIG_ADDON = {
+  id: 'org.stremio.seuaddonoriginal',           // Substitua pelo seu ID original
+  version: '1.0.0',
+  name: 'Nome Original do Seu Addon',           // Substitua pelo seu nome original
+  description: 'Sua descrição original aqui',   // Substitua pela sua descrição original
+  logo: 'https://exemplo.com/seu-logo.png',     // Substitua pela URL do seu logo original
+  types: ['movie', 'series'],
+  catalogs: [],
+  resources: ['stream'],
+  idPrefixes: ['tt']
+};
+
 const STREMIO_API = 'https://api.strem.io/api';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-const te = new TextEncoder();
 const td = new TextDecoder();
-
-function bytesParaB64u(bytes) {
-  let s = '';
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
 
 function b64uParaBytes(str) {
   let b = String(str).replace(/-/g, '+').replace(/_/g, '/');
@@ -34,7 +35,6 @@ function lerConfigConta(b64) {
 const limparUrl = (u) => String(u || '').trim().replace(/\/manifest\.json$/i, '').replace(/\/+$/, '');
 const hostDe = (u) => { try { return new URL(u).hostname; } catch { return ''; } };
 
-// Verifica se o manifesto tem o recurso "stream"
 function recursoStream(m) {
   for (const r of (m.resources || [])) {
     if (typeof r === 'string') { if (r === 'stream') return { types: m.types || [], prefixes: m.idPrefixes || [] }; }
@@ -43,7 +43,6 @@ function recursoStream(m) {
   return null;
 }
 
-// Busca os addons instalados na conta do Stremio
 const cacheContas = new Map();
 async function addonsDaConta(authKey) {
   const hit = cacheContas.get(authKey);
@@ -58,13 +57,13 @@ async function addonsDaConta(authKey) {
   
   if (!r.ok) throw new Error('Stremio HTTP ' + r.status);
   const j = await r.json();
-  if (!j.result || !Array.isArray(j.result.addons)) throw new Error('Sessão do Stremio inválida ou expirada');
+  if (!j.result || !Array.isArray(j.result.addons)) throw new Error('Sessão inválida');
   
   const lista = [];
   for (const a of j.result.addons) {
-    if (!a || !a.manifest || a.manifest.id === SELF_ID || !/^https?:/i.test(a.transportUrl || '')) continue;
+    if (!a || !a.manifest || a.manifest.id === CONFIG_ADDON.id || !/^https?:/i.test(a.transportUrl || '')) continue;
     const rec = recursoStream(a.manifest);
-    if (!rec) continue; // Apenas addons que possuem stream
+    if (!rec) continue;
     lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
   }
   
@@ -77,7 +76,7 @@ async function listaDeOrigens(cfgB64, host, tipo, id) {
   let lista = [];
   const cfg = lerConfigConta(cfgB64);
   if (cfg) {
-    try { lista = await addonsDaConta(cfg.k); } catch (e) { console.error('[conta Stremio]', e.message); }
+    try { lista = await addonsDaConta(cfg.k); } catch (e) {}
   }
   lista = lista
     .filter((a) => !a.types.length || !tipo || a.types.includes(tipo))
@@ -104,11 +103,10 @@ async function streamsDe(base, tipo, id) {
   }
 }
 
-// Lógica de validação individual de cada stream
+// Lógica de validação e remoção de streams incorretos
 async function verificarStreamValido(stream, id) {
   try {
-    // Insira aqui a sua lógica de checagem (duração, tamanho, etc.)
-    // Se retornar `false`, o stream é apagado completamente da lista.
+    // Insira sua regra de validação aqui. Retorne `false` para apagar o stream da lista.
     if (stream.title && stream.title.toLowerCase().includes("errado")) {
       return false;
     }
@@ -116,20 +114,6 @@ async function verificarStreamValido(stream, id) {
   } catch {
     return false;
   }
-}
-
-function manifest(base) {
-  return {
-    id: SELF_ID,
-    version: '2.0.0',
-    name: 'Verificador & Filtro de Streams',
-    description: 'Lê os addons de stream da sua conta Stremio e remove automaticamente conteúdos incorretos.',
-    resources: ['stream'],
-    types: ['movie', 'series'],
-    idPrefixes: ['tt'],
-    catalogs: [],
-    behaviorHints: { configurable: true },
-  };
 }
 
 function json(obj, status = 200) {
@@ -146,7 +130,7 @@ function json(obj, status = 200) {
 function paginaConfig() {
   const html = `<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Configuração - Filtro Stremio</title>
+<title>${CONFIG_ADDON.name} - Configuração</title>
 <style>
 body{font-family:system-ui,Arial,sans-serif;background:#121212;color:#fff;padding:20px;display:flex;justify-content:center;align-items:center;min-height:90vh;margin:0}
 .box{max-width:440px;width:100%;background:#1e1e1e;padding:25px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.6)}
@@ -159,8 +143,8 @@ p{color:#aaa;font-size:13px;line-height:1.4}
 #msg{color:#ffb74d;font-size:13px;min-height:18px;margin-top:6px}
 .btn-group{display:flex;flex-direction:column;gap:8px;margin-top:10px}
 </style></head><body><div class="box">
-<h2 style="text-align:center;color:#e50914;margin-top:0">Configurar Addon</h2>
-<p>Entre com a sua conta do Stremio. O addon vai ler automaticamente os seus addons de stream instalados ("do meta") e aplicar o filtro.</p>
+<h2 style="text-align:center;color:#e50914;margin-top:0">${CONFIG_ADDON.name}</h2>
+<p>Entre com a sua conta do Stremio para ler automaticamente os seus addons instalados e aplicar os filtros.</p>
 <input type="email" id="email" placeholder="E-mail do Stremio" autocomplete="username">
 <input type="password" id="senha" placeholder="Senha" autocomplete="current-password">
 <button onclick="entrar()">Entrar e Gerar Link</button>
@@ -215,7 +199,20 @@ export default {
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift();
       
       if (partes[0] === 'configure') return paginaConfig();
-      if (partes[0] === 'manifest.json') return json(manifest(base));
+      if (partes[0] === 'manifest.json') {
+        return json({
+          id: CONFIG_ADDON.id,
+          version: CONFIG_ADDON.version,
+          name: CONFIG_ADDON.name,
+          description: CONFIG_ADDON.description,
+          logo: CONFIG_ADDON.logo,
+          resources: CONFIG_ADDON.resources,
+          types: CONFIG_ADDON.types,
+          idPrefixes: CONFIG_ADDON.idPrefixes,
+          catalogs: CONFIG_ADDON.catalogs,
+          behaviorHints: { configurable: true }
+        });
+      }
 
       if (partes[0] === 'stream') {
         const tipo = decodeURIComponent(partes[1] || '');
@@ -225,15 +222,15 @@ export default {
           return json({ streams: [] });
         }
 
-        // 1. Pega os addons de stream instalados na conta do Stremio ("do meta")
+        // Lê os addons de stream instalados na conta do Stremio automaticamente
         const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
         
-        // 2. Busca os streams de todos os addons de origem em paralelo
+        // Busca os streams em paralelo
         const listas = await Promise.all(origens.map((a) => streamsDe(a.u, tipo, id)));
         const itensBrutos = [];
         origens.forEach((a, k) => listas[k].forEach((s) => itensBrutos.push(s)));
 
-        // 3. Valida cada stream e FILTRA (remove completamente os inválidos)
+        // Aplica o filtro e remove completamente os streams inválidos
         const promessasValidacao = itensBrutos.map(async (stream) => {
           const valido = await verificarStreamValido(stream, id);
           return { stream, valido };
