@@ -10,7 +10,11 @@
  *  4. A lista devolvida ao Stremio traz SÓ os vídeos que passaram no teste: o que o teste reprova (duração diferente
  *     do TMDB, arquivo reconhecido como outro título, nome do arquivo com outro filme/episódio, título não lançado)
  *     é REMOVIDO da lista. O que não deu para medir continua aparecendo e, se for escolhido, é conferido em /play/.
- *     Instale este addon por último na ordem dos addons.
+ *  5. TROCA DE ID: este addon responde também pelo META (/meta/...). Ele pega o meta do próximo addon da conta que tenha
+ *     meta (abaixo dele na ordem; ex.: Controle de Impróprios, AIOMetadata), troca os ids tt... por vrf:tt... (episódios; nos
+ *     filmes também o id e o defaultVideoId) e assim o Stremio só pede os streams a ELE (os outros addons não entendem vrf:).
+ *     Ids que não começam com tt (ex.: os que o Controle de Impróprios trocou) não são mexidos.
+ *     Instale este addon NO TOPO da lista de addons (o meta vale do primeiro addon que responde).
  *
  * A duração é lida do cabeçalho do arquivo por pedidos Range (MP4/MOV pelo átomo moov/mvhd; MKV/WebM pelo
  * Info/Duration; HLS pela soma dos trechos). O que não dá para medir é conferido pelo NOME do arquivo e, se nada
@@ -20,6 +24,7 @@
  *   TMDB_KEY (obrigatória)   SECRET (recomendada; sem ela usa a TMDB_KEY)   PUBLIC_URL (opcional)
  *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
  *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
+ *   ID_FILME (opcional): trocar (padrão: troca o id e o defaultVideoId do filme) | dica (só o defaultVideoId)
  */
 const SELF_ID = 'community.verificador.duracao';
 const STREMIO_API = 'https://api.strem.io/api';
@@ -42,6 +47,7 @@ let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
 let OS_KEY = '';
 let MODO = 'ocultar'; // ocultar | marcar | bloquear
+let MODO_FILME = 'trocar'; // trocar | dica
 
 async function carregarConfig(env) {
   KV = env.KV || null;
@@ -61,6 +67,7 @@ async function carregarConfig(env) {
   OS_KEY = await ler('OPENSUBTITLES_KEY');
   const modo = String((await ler('INCORRETOS')) || '').toLowerCase();
   MODO = ['ocultar', 'marcar', 'bloquear'].includes(modo) ? modo : (String(env.BLOQUEAR_INCORRETOS || '') === '0' ? 'marcar' : 'ocultar');
+  MODO_FILME = String((await ler('ID_FILME')) || '').toLowerCase() === 'dica' ? 'dica' : 'trocar';
 }
 
 // ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
@@ -561,6 +568,14 @@ function recursoStream(m) {
   return null;
 }
 
+function recursoMeta(m) {
+  for (const r of (m.resources || [])) {
+    if (typeof r === 'string') { if (r === 'meta') return { types: m.types || [], prefixes: m.idPrefixes || [] }; }
+    else if (r && r.name === 'meta') return { types: r.types || m.types || [], prefixes: r.idPrefixes || m.idPrefixes || [] };
+  }
+  return null;
+}
+
 // decide se o addon pode ser origem de vídeos: { rec } se sim, { ignorar: motivo } se não
 function avaliarAddon(m) {
   if (!m) return { ignorar: 'inválido' };
@@ -586,14 +601,20 @@ async function addonsDaConta(authKey) {
   if (!j.result || !Array.isArray(j.result.addons)) throw new Error('sessão do Stremio inválida ou expirada (gere o link de novo em /configure)');
   const lista = [];
   const ignorados = [];
-  for (const a of j.result.addons) {
+  const metas = [];
+  let posSelf = -1;
+  for (const [idx, a] of j.result.addons.entries()) {
     if (!a || !a.manifest || !/^https?:/i.test(a.transportUrl || '')) continue;
+    const ehSelf = a.manifest.id === SELF_ID || RE_PROPRIO.test(a.manifest.name || '');
+    if (ehSelf) { if (posSelf < 0) posSelf = idx; }
+    else { const rm = recursoMeta(a.manifest); if (rm) metas.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rm.types, prefixes: rm.prefixes, idx }); }
     const av = avaliarAddon(a.manifest);
     if (av.ignorar) { ignorados.push(`${a.manifest.name || hostDe(a.transportUrl)} (${av.ignorar})`); continue; } // fora: o próprio verificador, controle de impróprios e quem não tem stream
     const rec = av.rec;
     lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
   }
   lista.ignorados = ignorados;
+  lista.metas = posSelf >= 0 ? metas.filter((m) => m.idx > posSelf) : metas; // só os que ficam abaixo deste addon na ordem
   if (cacheContas.size >= 200) cacheContas.clear();
   cacheContas.set(authKey, { t: Date.now(), lista });
   return lista;
@@ -747,16 +768,67 @@ async function reescrever(s, base, tipo, id) {
   return Object.assign({}, s, { url: `${base}/play/${await criarToken({ u: s.url, i: id, t: tipo })}` });
 }
 
+// ---------- troca de id (meta) ----------
+// addons que têm meta e ficam abaixo deste na ordem da conta (o Stremio usaria o primeiro que respondesse)
+async function fontesDeMeta(cfgB64, host, tipo, id) {
+  const cfg = lerConfigConta(cfgB64);
+  if (!cfg || !cfg.k) return { lista: [], erro: 'link sem conta do Stremio (gere o link em /configure)' };
+  try {
+    const da = await addonsDaConta(cfg.k);
+    const lista = (da.metas || [])
+      .filter((a) => hostDe(a.u) !== host)
+      .filter((a) => !a.types.length || a.types.includes(tipo))
+      .filter((a) => !a.prefixes.length || a.prefixes.some((p) => id.startsWith(p)))
+      .slice(0, 4);
+    return { lista, erro: null };
+  } catch (e) { return { lista: [], erro: e.message }; }
+}
+
+async function metaDe(base, tipo, id, cabecalhos) {
+  const t0 = Date.now();
+  try {
+    const r = await fetch(`${base}/meta/${tipo}/${encodeURIComponent(id)}.json`, { headers: cabecalhos, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return { erro: `HTTP ${r.status}`, ms: Date.now() - t0 };
+    const j = await r.json();
+    if (j && j.meta && typeof j.meta === 'object' && j.meta.id) return { meta: j.meta, ms: Date.now() - t0 };
+    return { erro: 'respondeu sem meta', ms: Date.now() - t0 };
+  } catch (e) { return { erro: e && e.name === 'TimeoutError' ? 'tempo esgotado (8 s)' : String((e && e.message) || 'erro'), ms: Date.now() - t0 }; }
+}
+
+// troca tt... por vrf:tt... só onde o id ainda é tt (o que outro addon já trocou fica como está)
+const ehTT = (v) => typeof v === 'string' && /^tt\d+(:\d+:\d+)?$/.test(v);
+function trocarIds(meta, tipo) {
+  const m = Object.assign({}, meta);
+  const info = { videos: 0, filme: false };
+  if (Array.isArray(m.videos)) {
+    m.videos = m.videos.map((v) => {
+      if (v && ehTT(v.id)) { info.videos++; return Object.assign({}, v, { id: 'vrf:' + v.id }); }
+      return v;
+    });
+  }
+  const bh = Object.assign({}, m.behaviorHints);
+  if (ehTT(bh.defaultVideoId)) bh.defaultVideoId = 'vrf:' + bh.defaultVideoId;
+  if (tipo === 'movie' && typeof m.id === 'string' && /^tt\d+$/.test(m.id)) {
+    bh.defaultVideoId = 'vrf:' + m.id;
+    if (MODO_FILME === 'trocar') m.id = 'vrf:' + m.id;
+    info.filme = true;
+  }
+  if (Object.keys(bh).length) m.behaviorHints = bh;
+  return { meta: m, info };
+}
+
+const cacheMeta = new Map();
+
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.8.0',
+    version: '1.9.0',
     name: 'Verificador de Duração',
-    description: 'Lê os addons de vídeo da sua conta e mostra só os streams que passam no teste de duração (TMDB). Instale por último.',
+    description: 'Lê os addons de vídeo da sua conta e mostra só os streams que passam no teste de duração (TMDB). Troca o id (vrf:) para só ele responder aos vídeos. Instale NO TOPO da lista de addons.',
     logo: `${base}/check_tempo.png`,
-    resources: ['stream'],
+    resources: ['meta', 'stream'],
     types: ['movie', 'series'],
-    idPrefixes: ['tt'],
+    idPrefixes: ['tt', 'vrf:'],
     catalogs: [],
     behaviorHints: { configurable: true },
   };
@@ -883,7 +955,7 @@ export default {
       const partes = url.pathname.split('/').filter(Boolean);
       const base = PUBLIC_URL || url.origin;
       if (!partes.length) return Response.redirect(`${url.origin}/configure`, 302);
-      const RESERVADOS = ['configure', 'manifest.json', 'stream', 'play', 'health', 'diagnostico', 'check_tempo.png'];
+      const RESERVADOS = ['configure', 'manifest.json', 'meta', 'stream', 'play', 'health', 'diagnostico', 'check_tempo.png'];
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift(); // /<config>/manifest.json, /<config>/stream/...
       if (partes[0] === 'health') return json({ ok: true });
       if (partes[0] === 'configure') return paginaConfig();
@@ -901,17 +973,54 @@ export default {
           try { await tmdb('/configuration'); tmdbTeste = 'ok'; } catch (e) { tmdbTeste = 'falhou: ' + String((e && e.message) || e); }
         }
         const o = await listaDeOrigens(cfgB64, url.hostname, null, null);
+        const mf = await fontesDeMeta(cfgB64, url.hostname, 'movie', 'tt0000001');
         return json({
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
-          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n), fora_da_lista: o.ignorados,
+          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), erro_meta: mf.erro, id_filme: MODO_FILME,
         });
+      }
+
+      if (partes[0] === 'meta') {
+        const tipo = decodeURIComponent(partes[1] || '');
+        const idPed = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
+        const idTT = idPed.replace(/^vrf:/, '');
+        if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(idTT)) return json({ err: 'id não suportado' }, 404);
+        const ip = request.headers.get('CF-Connecting-IP') || '';
+        const ua = request.headers.get('User-Agent') || UA;
+        const cab = { 'User-Agent': ua, Accept: 'application/json' }; // repassa o aparelho (o Controle de Impróprios separa por IP/UA)
+        if (ip) { cab['X-Forwarded-For'] = ip; cab['X-Real-IP'] = ip; }
+        const chaveC = `${cfgB64.slice(-16)}|${MODO_FILME}|${tipo}|${idTT}|${ip}|${ua}`;
+        const emC = cacheMeta.get(chaveC);
+        if (emC && Date.now() - emC.t < 5 * 60 * 1000) return json({ meta: emC.meta });
+        const painel = [`meta ${tipo} ${idPed}`];
+        const f = await fontesDeMeta(cfgB64, url.hostname, tipo, idTT);
+        if (f.erro) painel.push(`  ! ${f.erro}`);
+        const tent = f.lista.map((a) => metaDe(a.u, tipo, idTT, cab)); // pedidos em paralelo; vale o primeiro da ordem que responder
+        let achado = null;
+        for (let k = 0; k < tent.length; k++) {
+          const r = await tent[k];
+          if (r.meta) { painel.push(`  ✔ ${f.lista[k].n}: meta recebido (${r.ms} ms) — usado`); achado = r.meta; break; }
+          painel.push(`  ✘ ${f.lista[k].n}: ${r.erro} (${r.ms} ms)`);
+        }
+        if (!achado) {
+          painel.push(f.lista.length ? '  = nenhuma fonte deu meta: o Stremio segue para o próximo addon (sem troca de id)' : '  = nenhum addon de meta abaixo deste na ordem: sem troca de id');
+          console.log('[meta] ' + painel.join('\n'));
+          return json({ err: 'sem fonte de meta' }, 404);
+        }
+        const tr = trocarIds(achado, tipo);
+        painel.push(`  = ids trocados: ${tr.info.videos} vídeo(s)${tr.info.filme ? `; filme (${MODO_FILME === 'trocar' ? 'id + defaultVideoId' : 'só defaultVideoId'})` : ''}`);
+        console.log('[meta] ' + painel.join('\n'));
+        if (cacheMeta.size >= 500) cacheMeta.clear();
+        cacheMeta.set(chaveC, { t: Date.now(), meta: tr.meta });
+        return json(url.searchParams.get('log') ? { painel, meta: tr.meta } : { meta: tr.meta });
       }
 
       if (partes[0] === 'stream') {
         const tipo = decodeURIComponent(partes[1] || '');
-        const id = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
+        const idPed = decodeURIComponent((partes[2] || '').replace(/\.json$/, ''));
+        const id = idPed.replace(/^vrf:/, ''); // vem vrf:tt... quando o meta passou por aqui
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
         const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
         const falhas = [];
@@ -979,7 +1088,7 @@ export default {
         } else {
           streams = itens.map((it) => it.s);
         }
-        const painel = [`${tipo} ${id}`];
+        const painel = [`${tipo} ${idPed}`];
         origens.lista.forEach((a) => {
           const e = estat.get(a.u) || {};
           const T = tally.get(a.n);
