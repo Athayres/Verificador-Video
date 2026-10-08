@@ -16,7 +16,6 @@ id = "1cd06a5363d1444fa7bcf08be3926a6f"
 
 # Ligação interna com o Worker do Controle de Impróprios (a Cloudflare bloqueia Worker chamando Worker pelo workers.dev: erro 1042).
 # "service" é o nome do Worker do Controle (o que aparece no endereço dele: controle-de-improprio.<sua-conta>.workers.dev).
-# quem ficar no topo chama o outro desmacar 3 linhas quem ficar em baixo comentar
-# [[services]]
-# binding = "CONTROLE"
-# service = "controle-de-improprio"
+ [[services]]
+ binding = "CONTROLE"
+ service = "controle-de-improprio"
