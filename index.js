@@ -25,6 +25,8 @@
  *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
  *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  *   ID_FILME (opcional): trocar (padrão: troca o id e o defaultVideoId do filme) | dica (só o defaultVideoId)
+ *   CONTROLE (opcional, ligação de serviço): liga este Worker ao Worker do Controle de Impróprios. A Cloudflare não deixa um
+ *   Worker chamar outro pelo endereço workers.dev (erro 1042); com a ligação o meta do Controle é lido por dentro.
  */
 const SELF_ID = 'community.verificador.duracao';
 const STREMIO_API = 'https://api.strem.io/api';
@@ -48,6 +50,7 @@ let MAX_SONDAS = 12;
 let OS_KEY = '';
 let MODO = 'ocultar'; // ocultar | marcar | bloquear
 let MODO_FILME = 'trocar'; // trocar | dica
+let CONTROLE_BIND = null; // ligação de serviço com o Controle de Impróprios (opcional)
 
 async function carregarConfig(env) {
   KV = env.KV || null;
@@ -68,6 +71,7 @@ async function carregarConfig(env) {
   const modo = String((await ler('INCORRETOS')) || '').toLowerCase();
   MODO = ['ocultar', 'marcar', 'bloquear'].includes(modo) ? modo : (String(env.BLOQUEAR_INCORRETOS || '') === '0' ? 'marcar' : 'ocultar');
   MODO_FILME = String((await ler('ID_FILME')) || '').toLowerCase() === 'dica' ? 'dica' : 'trocar';
+  CONTROLE_BIND = env.CONTROLE && typeof env.CONTROLE.fetch === 'function' ? env.CONTROLE : null;
 }
 
 // ---------- links assinados (impede usar o Worker para abrir endereços quaisquer) ----------
@@ -723,6 +727,17 @@ function checarNome(s, tipo, id, info) {
 
 const PREFIXO = 'Vídeo incorreto : ';
 
+// Nome mostrado no stream: "BestCine-autenticado" (passou na verificação) ou só "BestCine" (não deu para verificar).
+// O resto do nome original (qualidade, resolução...) continua embaixo.
+function rotuloOrigem(nomeOrig, origem, autenticado) {
+  const linhas = String(nomeOrig || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  if (linhas.length && linhas[0].toLowerCase().startsWith(origem.toLowerCase())) {
+    const resto = linhas[0].slice(origem.length).replace(/^[\s\-–:|·]+/, '');
+    if (resto) linhas[0] = resto; else linhas.shift();
+  }
+  return [autenticado ? `${origem}-autenticado` : origem, ...linhas].join('\n');
+}
+
 // Troca o próprio nome do stream: "Batman A queda do morcego parte 2" vira "Vídeo incorreto : Batman A queda do morcego parte 2"
 // (no nome e na 1ª linha do título/descrição) e acrescenta uma linha com o motivo.
 function marcarIncorreto(s, m) {
@@ -786,15 +801,33 @@ async function fontesDeMeta(cfgB64, host, tipo, id) {
   } catch (e) { return { lista: [], erro: e.message }; }
 }
 
-async function metaDe(base, tipo, id, cabecalhos) {
+async function metaDe(base, tipo, id, cabecalhos, ponte) {
   const t0 = Date.now();
   try {
-    const r = await fetch(`${base}/meta/${tipo}/${encodeURIComponent(id)}.json`, { headers: cabecalhos, signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return { erro: `HTTP ${r.status}`, ms: Date.now() - t0 };
+    const alvo = `${base}/meta/${tipo}/${encodeURIComponent(id)}.json`;
+    const r = ponte ? await ponte.fetch(alvo, { headers: cabecalhos }) : await fetch(alvo, { headers: cabecalhos, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      const dica = /1042/.test(t) ? ' — código 1042: a Cloudflare não deixa um Worker chamar outro pelo workers.dev; crie a ligação de serviço CONTROLE' : '';
+      return { erro: `HTTP ${r.status}${dica}`, ms: Date.now() - t0 };
+    }
     const j = await r.json();
-    if (j && j.meta && typeof j.meta === 'object' && j.meta.id) return { meta: j.meta, ms: Date.now() - t0 };
+    if (j && j.meta && typeof j.meta === 'object' && j.meta.id) return { meta: j.meta, ms: Date.now() - t0, via: ponte ? 'ligação interna' : '' };
     return { erro: 'respondeu sem meta', ms: Date.now() - t0 };
   } catch (e) { return { erro: e && e.name === 'TimeoutError' ? 'tempo esgotado (8 s)' : String((e && e.message) || 'erro'), ms: Date.now() - t0 }; }
+}
+
+// Completa o meta do Controle de Impróprios com o de outra fonte, só em campos de aparência que ele deixou vazios.
+// Nunca mexe em id, vídeos nem behaviorHints: é por eles que o Controle bloqueia.
+const CAMPOS_COMPLETAR = ['name', 'poster', 'background', 'logo', 'description', 'genres', 'runtime', 'releaseInfo', 'released', 'year', 'cast', 'director', 'writer', 'imdbRating', 'country', 'awards', 'website', 'trailers', 'language'];
+function completarMeta(principal, outro) {
+  const m = Object.assign({}, principal);
+  const vazio = (v) => v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length);
+  const preenchidos = [];
+  for (const c of CAMPOS_COMPLETAR) {
+    if (vazio(m[c]) && !vazio(outro[c])) { m[c] = outro[c]; preenchidos.push(c); }
+  }
+  return { meta: m, preenchidos };
 }
 
 // troca tt... por vrf:tt... só onde o id ainda é tt (o que outro addon já trocou fica como está)
@@ -1006,7 +1039,9 @@ export default {
           testeMeta = await Promise.all(fontesT.lista.map(async (a) => {
             const t0 = Date.now();
             try {
-              const r = await fetch(`${a.u}/meta/${tipoT}/${idT}.json`, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+              const ponte = RE_PARENTAL.test(a.n) ? CONTROLE_BIND : null;
+              const alvoT = `${a.u}/meta/${tipoT}/${idT}.json`;
+              const r = ponte ? await ponte.fetch(alvoT, { headers: { 'User-Agent': UA, Accept: 'application/json' } }) : await fetch(alvoT, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
               const txt = await r.text();
               let desc = '';
               try { const jj = JSON.parse(txt); desc = String((jj.meta && jj.meta.description) || '').slice(0, 300); } catch { /* não é JSON */ }
@@ -1019,7 +1054,7 @@ export default {
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
-          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, erro_meta: mf.erro, id_filme: MODO_FILME,
+          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, ligacao_controle: CONTROLE_BIND ? 'ativa' : 'não criada (ligação de serviço CONTROLE)', erro_meta: mf.erro, id_filme: MODO_FILME,
         });
       }
 
@@ -1038,11 +1073,26 @@ export default {
         const painel = [`meta ${tipo} ${idPed}`];
         const f = await fontesDeMeta(cfgB64, url.hostname, tipo, idTT);
         if (f.erro) painel.push(`  ! ${f.erro}`);
-        const tent = f.lista.map((a) => metaDe(a.u, tipo, idTT, cab)); // pedidos em paralelo; vale o primeiro da ordem que responder
+        const cabPonte = Object.assign({}, cab, ip ? { 'CF-Connecting-IP': ip } : {});
+        const tent = f.lista.map((a) => { const ponte = RE_PARENTAL.test(a.n) ? CONTROLE_BIND : null; return metaDe(a.u, tipo, idTT, ponte ? cabPonte : cab, ponte); }); // em paralelo; vale o primeiro da ordem que responder
         let achado = null;
         for (let k = 0; k < tent.length; k++) {
           const r = await tent[k];
-          if (r.meta) { painel.push(`  ✔ ${f.lista[k].n}: meta recebido (${r.ms} ms) — usado`); achado = r.meta; break; }
+          if (r.meta) {
+            achado = r.meta;
+            let extra = '';
+            if (RE_PARENTAL.test(f.lista[k].n) && k + 1 < tent.length) { // Controle: junta com a próxima fonte que responder (até 1,5 s)
+              const resto = await Promise.race([Promise.all(tent.slice(k + 1)), new Promise((res) => setTimeout(() => res(null), 1500))]);
+              const o = resto && resto.findIndex((x) => x && x.meta);
+              if (resto && o >= 0) {
+                const c = completarMeta(achado, resto[o].meta);
+                achado = c.meta;
+                if (c.preenchidos.length) extra = `; completado com ${f.lista[k + 1 + o].n}: ${c.preenchidos.join(', ')}`;
+              }
+            }
+            painel.push(`  ✔ ${f.lista[k].n}: meta recebido (${r.ms} ms${r.via ? `, ${r.via}` : ''}) — usado${extra}`);
+            break;
+          }
           painel.push(`  ✘ ${f.lista[k].n}: ${r.erro} (${r.ms} ms)`);
         }
         if (!achado) {
@@ -1100,6 +1150,7 @@ export default {
             else if (v.status === 'nao_verificado') situacao = 'não deu para ler a duração do arquivo';
             else situacao = `${v.status.toUpperCase()} (${v.texto || `arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min`})`;
             let marca = null;
+            let autenticado = !!(v && v.status === 'ok');
             if (naoLancado) {
               marca = { rotulo: 'NÃO LANÇADO', texto: `este título só estreia em ${dataBR}; um arquivo disponível agora é provavelmente falso` };
               situacao = `NÃO LANÇADO (estreia em ${dataBR})`;
@@ -1109,7 +1160,7 @@ export default {
               if (!ehDireto(it.s) && bh.videoHash && bh.videoSize) { // torrent/addon que informa o hash: pergunta ao site externo
                 const ext = await autenticidadePorHash(String(bh.videoHash), Number(bh.videoSize), id).catch(() => null);
                 if (ext && ext.status === 'errado') { marca = { por: ext.por, texto: ext.texto }; situacao = `ERRADO (${ext.texto})`; }
-                else if (ext && ext.status === 'ok') situacao = `OK (${ext.texto})`;
+                else if (ext && ext.status === 'ok') { situacao = `OK (${ext.texto})`; autenticado = true; }
               }
               const motivo = !marca && info ? checarNome(it.s, tipo, id, info) : null;
               if (motivo) { marca = { por: 'nome do arquivo', texto: motivo }; situacao = `ERRADO pelo nome: ${motivo}`; }
@@ -1123,6 +1174,8 @@ export default {
               reprovados++;
               if (MODO === 'ocultar') return null; // só fica na lista quem passou no teste
               s = MODO === 'bloquear' ? bloquearStream(it.s, marca, id.split(':')[0]) : marcarIncorreto(s, marca);
+            } else {
+              s = Object.assign({}, s, { name: rotuloOrigem(it.s.name, it.origem, autenticado) });
             }
             return s;
           }))).filter(Boolean);
