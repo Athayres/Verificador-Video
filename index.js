@@ -399,10 +399,12 @@ async function hashDoArquivo(url) {
 
 const ttDe = (n) => (n && Number(n) ? 'tt' + String(n).padStart(7, '0') : null);
 
+const resumoOS = (a) => (a && a.length) ? a.slice(0, 3).map((x) => `${x.titulo || '?'} (${x.serie || x.imdb || '?'})`).join('; ') : 'hash desconhecido no OpenSubtitles';
+
 // lista de títulos que o OpenSubtitles conhece para esse hash ([] = hash desconhecido; undefined = consulta falhou)
 async function consultarOpenSubtitles(hash, tamanho) {
   const c = await cLer('os', hash);
-  if (c !== undefined) return c;
+  if (c !== undefined) { console.log(`[opensubtitles] ${hash} (cache): ${resumoOS(c)}`); return c; }
   let achados;
   try {
     if (OS_KEY) {
@@ -410,7 +412,7 @@ async function consultarOpenSubtitles(hash, tamanho) {
         headers: { 'Api-Key': OS_KEY, 'User-Agent': 'VerificadorDuracao v1.0', Accept: 'application/json' },
         signal: AbortSignal.timeout(6000),
       });
-      if (!r.ok) return undefined;
+      if (!r.ok) { console.log(`[opensubtitles] ${hash}: consulta falhou (HTTP ${r.status}, API nova)`); return undefined; }
       const j = await r.json();
       achados = (j.data || []).filter((x) => x.attributes && x.attributes.moviehash_match).map((x) => {
         const f = x.attributes.feature_details || {};
@@ -421,14 +423,15 @@ async function consultarOpenSubtitles(hash, tamanho) {
         headers: { 'X-User-Agent': 'TemporaryUserAgent', Accept: 'application/json' },
         signal: AbortSignal.timeout(6000),
       });
-      if (!r.ok) return undefined;
+      if (!r.ok) { console.log(`[opensubtitles] ${hash}: consulta falhou (HTTP ${r.status}, endereço antigo sem chave)`); return undefined; }
       const j = await r.json();
       achados = (Array.isArray(j) ? j : []).filter((x) => x.MatchedBy === 'moviehash').map((x) => ({
         imdb: ttDe(x.IDMovieImdb), serie: ttDe(x.SeriesIMDBParent), titulo: x.MovieName || '',
       }));
     }
-  } catch { return undefined; }
+  } catch (e) { console.log(`[opensubtitles] ${hash}: consulta falhou (${String((e && e.message) || e)})`); return undefined; }
   await cGravar('os', hash, achados);
+  console.log(`[opensubtitles] ${hash}: ${resumoOS(achados)}`);
   return achados;
 }
 
@@ -436,8 +439,9 @@ async function consultarOpenSubtitles(hash, tamanho) {
 async function autenticidadePorHash(hash, tamanho, id) {
   const achados = await consultarOpenSubtitles(hash, tamanho);
   const POR = 'autenticidade, OpenSubtitles';
-  if (!achados || !achados.length) return { status: 'nao_verificado' };
+  if (!achados || !achados.length) { console.log(`[opensubtitles] ${id}: não verificado (${achados ? 'hash desconhecido' : 'consulta sem resposta'})`); return { status: 'nao_verificado' }; }
   const pedido = String(id).split(':')[0];
+  console.log(`[opensubtitles] ${id}: pedido ${pedido}, OpenSubtitles diz ${resumoOS(achados)}`);
   if (achados.some((a) => a.imdb === pedido || a.serie === pedido)) return { status: 'ok', por: POR, texto: 'o arquivo é reconhecido como este título' };
   const a = achados.find((x) => x.imdb || x.serie);
   if (!a) return { status: 'nao_verificado' };
@@ -447,7 +451,8 @@ async function autenticidadePorHash(hash, tamanho, id) {
 async function autenticidadeDoLink(url, id) {
   try {
     const h = await hashDoArquivo(url);
-    return h ? await autenticidadePorHash(h.hash, h.tamanho, id) : { status: 'nao_verificado' };
+    if (!h) { console.log(`[opensubtitles] ${id}: hash não calculado em ${hostDe(url)} (servidor sem Range ou arquivo pequeno)`); return { status: 'nao_verificado' }; }
+    return await autenticidadePorHash(h.hash, h.tamanho, id);
   } catch { return { status: 'nao_verificado' }; }
 }
 
@@ -580,13 +585,15 @@ async function addonsDaConta(authKey) {
   const j = await r.json();
   if (!j.result || !Array.isArray(j.result.addons)) throw new Error('sessão do Stremio inválida ou expirada (gere o link de novo em /configure)');
   const lista = [];
+  const ignorados = [];
   for (const a of j.result.addons) {
     if (!a || !a.manifest || !/^https?:/i.test(a.transportUrl || '')) continue;
     const av = avaliarAddon(a.manifest);
-    if (av.ignorar) continue; // fora: o próprio verificador, controle de impróprios e quem não tem stream
+    if (av.ignorar) { ignorados.push(`${a.manifest.name || hostDe(a.transportUrl)} (${av.ignorar})`); continue; } // fora: o próprio verificador, controle de impróprios e quem não tem stream
     const rec = av.rec;
     lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
   }
+  lista.ignorados = ignorados;
   if (cacheContas.size >= 200) cacheContas.clear();
   cacheContas.set(authKey, { t: Date.now(), lista });
   return lista;
@@ -596,25 +603,30 @@ async function addonsDaConta(authKey) {
 async function listaDeOrigens(cfgB64, host, tipo, id) {
   let lista = [];
   let erro = null;
+  let ignorados = [];
+  const puladas = [];
   const cfg = lerConfigConta(cfgB64);
   if (cfg) {
     lista = lista.concat(cfg.a); // lista gravada no próprio link (vale mesmo que o addon original seja desinstalado do Stremio)
     if (cfg.k) {
-      try { lista = lista.concat(await addonsDaConta(cfg.k)); } catch (e) { erro = e.message; console.error('[conta Stremio]', e.message); }
+      try { const da = await addonsDaConta(cfg.k); ignorados = da.ignorados || []; lista = lista.concat(da); } catch (e) { erro = e.message; console.error('[conta Stremio]', e.message); }
     }
   }
   const fora = new Set(cfg ? cfg.x : []);
   lista = lista
-    .filter((a) => !fora.has(a.u))                                        // desmarcados na /configure
+    .filter((a) => { if (fora.has(a.u)) { puladas.push(`${a.n} (desmarcado em /configure)`); return false; } return true; }) // desmarcados na /configure
     .filter((a) => !RE_PROPRIO.test(a.n) && !RE_PARENTAL.test(a.n))      // links antigos que ainda os continham
-    .filter((a) => !a.types.length || !tipo || a.types.includes(tipo))
-    .filter((a) => !a.prefixes.length || !id || a.prefixes.some((p) => id.startsWith(p)));
+    .filter((a) => {
+      const ok = (!a.types.length || !tipo || a.types.includes(tipo)) && (!a.prefixes.length || !id || a.prefixes.some((p) => id.startsWith(p)));
+      if (!ok) puladas.push(`${a.n} (não atende o tipo/id pedido)`);
+      return ok;
+    });
   const vistos = new Set();
   const final = lista
     .filter((a) => hostDe(a.u) !== host)          // nunca chama a si mesmo
     .filter((a) => !vistos.has(a.u) && vistos.add(a.u))
     .slice(0, 30);
-  return { lista: final, erro, temConta: !!cfg };
+  return { lista: final, erro, temConta: !!cfg, ignorados, puladas };
 }
 
 // ---------- conferência da lista (marca o título dos vídeos incorretos) ----------
@@ -707,18 +719,22 @@ function bloquearStream(s, m, imdb) {
 }
 
 // ---------- addons de origem ----------
-async function streamsDe(base, tipo, id, nome, falhas) {
+async function streamsDe(base, tipo, id, nome, falhas, estat) {
+  const t0 = Date.now();
   try {
     const r = await fetch(`${base}/stream/${tipo}/${encodeURIComponent(id)}.json`, {
       headers: { 'User-Agent': UA, Accept: 'application/json' },
       signal: AbortSignal.timeout(15000),
     });
-    if (!r.ok) { if (falhas) falhas.push(`${nome}: HTTP ${r.status}`); console.error('origem HTTP', r.status, base); return []; }
+    if (!r.ok) { if (falhas) falhas.push(`${nome}: HTTP ${r.status}`); if (estat) estat.set(base, { ms: Date.now() - t0, erro: `HTTP ${r.status}` }); console.error('origem HTTP', r.status, base); return []; }
     const j = await r.json();
-    return Array.isArray(j.streams) ? j.streams : [];
+    const arr = Array.isArray(j.streams) ? j.streams : [];
+    if (estat) estat.set(base, { ms: Date.now() - t0, n: arr.length });
+    return arr;
   } catch (e) {
     console.error('origem falhou:', base, e && e.message);
     if (falhas) falhas.push(`${nome}: ${(e && e.message) || 'erro'}`);
+    if (estat) estat.set(base, { ms: Date.now() - t0, erro: e && e.name === 'TimeoutError' ? 'tempo esgotado (15 s)' : String((e && e.message) || 'erro') });
     return [];
   }
 }
@@ -889,7 +905,7 @@ export default {
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
-          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
+          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n), fora_da_lista: o.ignorados,
         });
       }
 
@@ -899,7 +915,9 @@ export default {
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
         const origens = await listaDeOrigens(cfgB64, url.hostname, tipo, id);
         const falhas = [];
-        const listas = await Promise.all(origens.lista.map((a) => streamsDe(a.u, tipo, id, a.n, falhas)));
+        const estat = new Map();
+        const tally = new Map(); // por addon: aprovados, reprovados (e por quê), sem medir
+        const listas = await Promise.all(origens.lista.map((a) => streamsDe(a.u, tipo, id, a.n, falhas, estat)));
         const itens = [];
         origens.lista.forEach((a, k) => listas[k].forEach((s) => itens.push({ s, origem: a.n })));
         const log = falhas.map((f) => `[falhou] ${f}`);
@@ -946,6 +964,9 @@ export default {
               else if (nomeDoArquivo(it.s)) situacao += ` | nome "${nomeDoArquivo(it.s).slice(0, 70)}" sem sinais de erro`;
             }
             log.push(`[${it.origem}] ${nome} -> ${situacao}`);
+            const T = tally.get(it.origem) || (tally.set(it.origem, { ok: 0, reprov: 0, semMedir: 0, motivos: {} }), tally.get(it.origem));
+            if (!marca) { if (v && v.status === 'ok') T.ok++; else T.semMedir++; }
+            else { T.reprov++; const mo = marca.por || marca.rotulo || 'outro'; T.motivos[mo] = (T.motivos[mo] || 0) + 1; }
             if (marca) {
               reprovados++;
               if (MODO === 'ocultar') return null; // só fica na lista quem passou no teste
@@ -958,7 +979,25 @@ export default {
         } else {
           streams = itens.map((it) => it.s);
         }
-        return json(url.searchParams.get('log') ? { streams, log } : { streams });
+        const painel = [`${tipo} ${id}`];
+        origens.lista.forEach((a) => {
+          const e = estat.get(a.u) || {};
+          const T = tally.get(a.n);
+          if (e.erro) painel.push(`  ✘ ${a.n}: ${e.erro} (${e.ms} ms)`);
+          else if (!e.n) painel.push(`  ○ ${a.n}: respondeu, mas sem streams (${e.ms} ms)`);
+          else {
+            const mot = T && T.reprov ? ` [${Object.entries(T.motivos).map(([k, v]) => `${k}: ${v}`).join(', ')}]` : '';
+            painel.push(`  ✔ ${a.n}: ${e.n} streams (${e.ms} ms)` + (T ? ` → ${T.ok} aprovados, ${T.reprov} reprovados${mot}, ${T.semMedir} sem medir` : ' (sem verificação: falta TMDB_KEY/SECRET)'));
+          }
+        });
+        if (!origens.lista.length) painel.push('  nenhum addon de stream consultado');
+        if (origens.puladas.length) painel.push(`  – pulados neste pedido: ${origens.puladas.join('; ')}`);
+        if (origens.ignorados.length) painel.push(`  – fora da lista: ${origens.ignorados.join('; ')}`);
+        if (origens.erro) painel.push(`  ! conta do Stremio: ${origens.erro}`);
+        else if (!origens.temConta) painel.push('  ! link sem conta/lista de addons: gere o link em /configure');
+        painel.push(`  = na lista final: ${streams.length} streams`);
+        console.log('[painel] ' + painel.join('\n'));
+        return json(url.searchParams.get('log') ? { painel, streams, log } : { streams });
       }
 
       if (partes[0] === 'play') {
