@@ -34,7 +34,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const TTL = 24 * 3600 * 1000;
 
 // addons que NUNCA entram como origem de vídeos (além dos que não têm "stream")
-const RE_PROPRIO = /verificador de dura[cç][aã]o/i;
+const RE_PROPRIO = /verificador de dura[cç][aã]o|^\s*autenticado\s*$/i; // nome antigo e o nome atual do addon
 const RE_PARENTAL = /controle de impr[oó]prios?|guia dos pais|parents?[ _-]?guide|parental|classifica[cç][aã]o indicativa|content[ _-]?(advisory|rating|warning)|age[ _-]?(rating|gate|block)/i;
 
 let TMDB_KEY = '';
@@ -757,6 +757,17 @@ function bloquearStream(s, m, imdb) {
 }
 
 // ---------- addons de origem ----------
+// Começo da resposta de erro de um addon (servidor + texto), para o painel mostrar POR QUE deu 403/530.
+async function motivoDaFalha(r) {
+  try {
+    const t = (await r.text()).replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+    const srv = r.headers.get('server') || '';
+    const partes = [srv && `servidor: ${srv}`, t && `"${t}"`].filter(Boolean);
+    const desafio = r.headers.get('cf-mitigated') ? ' [desafio da Cloudflare]' : '';
+    return partes.length || desafio ? ` — ${partes.join(', ')}${desafio}` : '';
+  } catch { return ''; }
+}
+
 async function streamsDe(base, tipo, id, nome, falhas, estat) {
   const t0 = Date.now();
   try {
@@ -764,7 +775,13 @@ async function streamsDe(base, tipo, id, nome, falhas, estat) {
       headers: { 'User-Agent': UA, Accept: 'application/json' },
       signal: AbortSignal.timeout(15000),
     });
-    if (!r.ok) { if (falhas) falhas.push(`${nome}: HTTP ${r.status}`); if (estat) estat.set(base, { ms: Date.now() - t0, erro: `HTTP ${r.status}` }); console.error('origem HTTP', r.status, base); return []; }
+    if (!r.ok) {
+      const motivo = await motivoDaFalha(r);
+      if (falhas) falhas.push(`${nome}: HTTP ${r.status}${motivo}`);
+      if (estat) estat.set(base, { ms: Date.now() - t0, erro: `HTTP ${r.status}${motivo}` });
+      console.error('origem HTTP', r.status, base);
+      return [];
+    }
     const j = await r.json();
     const arr = Array.isArray(j.streams) ? j.streams : [];
     if (estat) estat.set(base, { ms: Date.now() - t0, n: arr.length });
@@ -867,13 +884,26 @@ async function registrar(linha) {
     await KV.put('ultimos', JSON.stringify(atual));
   } catch { /* só um registro: se falhar, segue */ }
 }
+// Guarda o próprio link (com a config da conta) no KV, para o Controle de Impróprios achar este addon sem você configurar nada.
+let linkGravado = '';
+function gravarMeuLink(ctx, url, cfgB64) {
+  if (!KV || !cfgB64) return;
+  const cfg = lerConfigConta(cfgB64);
+  if (!cfg || !cfg.k) return; // só o link com a conta do Stremio serve para o meta
+  const link = `${url.origin}/${cfgB64}`;
+  if (link === linkGravado) return;
+  linkGravado = link;
+  const p = Promise.resolve(KV.put('AUTENTICADO_URL', link)).catch(() => { linkGravado = ''; });
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+}
+
 const guardar = (ctx, linha) => { const p = registrar(linha); if (ctx && ctx.waitUntil) ctx.waitUntil(p); };
 
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
-    version: '1.9.0',
-    name: 'Verificador de Duração',
+    version: '1.9.1',
+    name: 'Autenticado', // é o nome do botão ao lado de "All" na lista de streams
     description: 'Lê os addons de vídeo da sua conta e mostra só os streams que passam no teste de duração (TMDB). Troca o id (vrf:) para só ele responder aos vídeos. Instale NO TOPO da lista de addons.',
     logo: `${base}/check_tempo.png`,
     resources: ['meta', 'stream'],
@@ -1007,6 +1037,7 @@ export default {
       if (!partes.length) return Response.redirect(`${url.origin}/configure`, 302);
       const RESERVADOS = ['configure', 'manifest.json', 'meta', 'stream', 'play', 'health', 'diagnostico', 'ultimos', 'check_tempo.png'];
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift(); // /<config>/manifest.json, /<config>/stream/...
+      if (['manifest.json', 'meta', 'stream'].includes(partes[0])) gravarMeuLink(ctx, url, cfgB64);
       if (partes[0] === 'health') return json({ ok: true });
       if (partes[0] === 'configure') return paginaConfig();
       if (partes[0] === 'manifest.json') return json(manifest(base));
@@ -1041,7 +1072,7 @@ export default {
             try {
               const ponte = RE_PARENTAL.test(a.n) ? CONTROLE_BIND : null;
               const alvoT = `${a.u}/meta/${tipoT}/${idT}.json`;
-              const r = ponte ? await ponte.fetch(alvoT, { headers: { 'User-Agent': UA, Accept: 'application/json' } }) : await fetch(alvoT, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+              const r = ponte ? await ponte.fetch(alvoT, { headers: { 'User-Agent': UA, Accept: 'application/json', 'X-Via': 'autenticado' } }) : await fetch(alvoT, { headers: { 'User-Agent': UA, Accept: 'application/json', 'X-Via': 'autenticado' }, signal: AbortSignal.timeout(8000) });
               const txt = await r.text();
               let desc = '';
               try { const jj = JSON.parse(txt); desc = String((jj.meta && jj.meta.description) || '').slice(0, 300); } catch { /* não é JSON */ }
@@ -1065,13 +1096,15 @@ export default {
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(idTT)) return json({ err: 'id não suportado' }, 404);
         const ip = request.headers.get('CF-Connecting-IP') || '';
         const ua = request.headers.get('User-Agent') || UA;
-        const cab = { 'User-Agent': ua, Accept: 'application/json' }; // repassa o aparelho (o Controle de Impróprios separa por IP/UA)
+        const cab = { 'User-Agent': ua, Accept: 'application/json', 'X-Via': 'autenticado' }; // repassa o aparelho (o Controle separa por IP/UA); X-Via evita que o Controle chame de volta
+        const viaControle = /controle/i.test(request.headers.get('X-Via') || ''); // pedido vindo do Controle: não chama o Controle de volta
         if (ip) { cab['X-Forwarded-For'] = ip; cab['X-Real-IP'] = ip; }
-        const chaveC = `${cfgB64.slice(-16)}|${MODO_FILME}|${tipo}|${idTT}|${ip}|${ua}`;
+        const chaveC = `${cfgB64.slice(-16)}|${MODO_FILME}|${viaControle ? 'c' : ''}|${tipo}|${idTT}|${ip}|${ua}`;
         const emC = cacheMeta.get(chaveC);
         if (emC && Date.now() - emC.t < 5 * 60 * 1000) return json({ meta: emC.meta });
         const painel = [`meta ${tipo} ${idPed}`];
         const f = await fontesDeMeta(cfgB64, url.hostname, tipo, idTT);
+        if (viaControle) f.lista = f.lista.filter((a) => !RE_PARENTAL.test(a.n));
         if (f.erro) painel.push(`  ! ${f.erro}`);
         const cabPonte = Object.assign({}, cab, ip ? { 'CF-Connecting-IP': ip } : {});
         const tent = f.lista.map((a) => { const ponte = RE_PARENTAL.test(a.n) ? CONTROLE_BIND : null; return metaDe(a.u, tipo, idTT, ponte ? cabPonte : cab, ponte); }); // em paralelo; vale o primeiro da ordem que responder
