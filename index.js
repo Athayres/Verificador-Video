@@ -606,9 +606,11 @@ async function addonsDaConta(authKey) {
   for (const [idx, a] of j.result.addons.entries()) {
     if (!a || !a.manifest || !/^https?:/i.test(a.transportUrl || '')) continue;
     const ehSelf = a.manifest.id === SELF_ID || RE_PROPRIO.test(a.manifest.name || '');
-    if (ehSelf) { if (posSelf < 0) posSelf = idx; }
-    else { const rm = recursoMeta(a.manifest); if (rm) metas.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rm.types, prefixes: rm.prefixes, idx }); }
+    if (ehSelf && posSelf < 0) posSelf = idx;
+    const rm = ehSelf ? null : recursoMeta(a.manifest);
     const av = avaliarAddon(a.manifest);
+    // fonte de meta: só quem NÃO é fonte de vídeos (addon com meta + stream, como o BestCine, não entra)
+    if (av.ignorar && rm) metas.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rm.types, prefixes: rm.prefixes, idx });
     if (av.ignorar) { ignorados.push(`${a.manifest.name || hostDe(a.transportUrl)} (${av.ignorar})`); continue; } // fora: o próprio verificador, controle de impróprios e quem não tem stream
     const rec = av.rec;
     lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
@@ -978,7 +980,8 @@ export default {
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
-          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), erro_meta: mf.erro, id_filme: MODO_FILME,
+          link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
+          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), erro_meta: mf.erro, id_filme: MODO_FILME,
         });
       }
 
