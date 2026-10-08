@@ -997,12 +997,29 @@ export default {
         }
         const o = await listaDeOrigens(cfgB64, url.hostname, null, null);
         const mf = await fontesDeMeta(cfgB64, url.hostname, 'movie', 'tt0000001');
+        // /diagnostico?testar=tt5537002 (&tipo=series): pede o meta a cada fonte e mostra o que ela responde
+        let testeMeta;
+        const idT = url.searchParams.get('testar') || '';
+        if (/^tt\d+$/.test(idT)) {
+          const tipoT = url.searchParams.get('tipo') === 'series' ? 'series' : 'movie';
+          const fontesT = await fontesDeMeta(cfgB64, url.hostname, tipoT, idT);
+          testeMeta = await Promise.all(fontesT.lista.map(async (a) => {
+            const t0 = Date.now();
+            try {
+              const r = await fetch(`${a.u}/meta/${tipoT}/${idT}.json`, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+              const txt = await r.text();
+              let desc = '';
+              try { const jj = JSON.parse(txt); desc = String((jj.meta && jj.meta.description) || '').slice(0, 300); } catch { /* não é JSON */ }
+              return { addon: a.n, site: hostDe(a.u), status: r.status, ms: Date.now() - t0, resposta_inicio: txt.slice(0, 300), descricao_do_meta: desc };
+            } catch (e) { return { addon: a.n, site: hostDe(a.u), erro: String((e && e.message) || e), ms: Date.now() - t0 }; }
+          }));
+        }
         return json({
           tmdb_key_definida: !!TMDB_KEY, tmdb_teste: tmdbTeste, secret_definido: !!SECRET, kv_ligado: !!KV,
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
-          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), erro_meta: mf.erro, id_filme: MODO_FILME,
+          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, erro_meta: mf.erro, id_filme: MODO_FILME,
         });
       }
 
