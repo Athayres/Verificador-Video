@@ -821,6 +821,21 @@ function trocarIds(meta, tipo) {
 
 const cacheMeta = new Map();
 
+// últimos pedidos (meta e stream), para ver em /ultimos sem abrir os logs da Cloudflare
+const recentes = [];
+async function registrar(linha) {
+  const hora = new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(11, 19); // horário de Brasília
+  const l = `${hora}\n${linha}`;
+  recentes.unshift(l); recentes.splice(30);
+  if (!KV) return;
+  try {
+    const atual = JSON.parse((await KV.get('ultimos')) || '[]');
+    atual.unshift(l); atual.splice(30);
+    await KV.put('ultimos', JSON.stringify(atual));
+  } catch { /* só um registro: se falhar, segue */ }
+}
+const guardar = (ctx, linha) => { const p = registrar(linha); if (ctx && ctx.waitUntil) ctx.waitUntil(p); };
+
 function manifest(base) {
   return {
     id: 'community.verificador.duracao',
@@ -957,7 +972,7 @@ export default {
       const partes = url.pathname.split('/').filter(Boolean);
       const base = PUBLIC_URL || url.origin;
       if (!partes.length) return Response.redirect(`${url.origin}/configure`, 302);
-      const RESERVADOS = ['configure', 'manifest.json', 'meta', 'stream', 'play', 'health', 'diagnostico', 'check_tempo.png'];
+      const RESERVADOS = ['configure', 'manifest.json', 'meta', 'stream', 'play', 'health', 'diagnostico', 'ultimos', 'check_tempo.png'];
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift(); // /<config>/manifest.json, /<config>/stream/...
       if (partes[0] === 'health') return json({ ok: true });
       if (partes[0] === 'configure') return paginaConfig();
@@ -967,6 +982,12 @@ export default {
         return new Response(b64uParaBytes(LOGO_B64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')), {
           headers: { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400', 'Access-Control-Allow-Origin': '*' },
         });
+      }
+
+      if (partes[0] === 'ultimos') { // últimos pedidos do Stremio a este addon (mais novo primeiro)
+        let lista = recentes;
+        if (KV) { try { const l = JSON.parse((await KV.get('ultimos')) || '[]'); if (l.length) lista = l; } catch { /* usa a memória */ } }
+        return texto(200, lista.length ? lista.join('\n\n') : 'Nada registrado ainda. Abra um filme ou série no Stremio e atualize esta página (pode levar até 1 minuto).');
       }
 
       if (partes[0] === 'diagnostico') { // mostra se as configurações foram lidas (nunca mostra as chaves)
@@ -1010,11 +1031,13 @@ export default {
         if (!achado) {
           painel.push(f.lista.length ? '  = nenhuma fonte deu meta: o Stremio segue para o próximo addon (sem troca de id)' : '  = nenhum addon de meta abaixo deste na ordem: sem troca de id');
           console.log('[meta] ' + painel.join('\n'));
+          guardar(ctx, painel.join('\n'));
           return json({ err: 'sem fonte de meta' }, 404);
         }
         const tr = trocarIds(achado, tipo);
         painel.push(`  = ids trocados: ${tr.info.videos} vídeo(s)${tr.info.filme ? `; filme (${MODO_FILME === 'trocar' ? 'id + defaultVideoId' : 'só defaultVideoId'})` : ''}`);
         console.log('[meta] ' + painel.join('\n'));
+        guardar(ctx, painel.join('\n'));
         if (cacheMeta.size >= 500) cacheMeta.clear();
         cacheMeta.set(chaveC, { t: Date.now(), meta: tr.meta });
         return json(url.searchParams.get('log') ? { painel, meta: tr.meta } : { meta: tr.meta });
@@ -1109,6 +1132,7 @@ export default {
         else if (!origens.temConta) painel.push('  ! link sem conta/lista de addons: gere o link em /configure');
         painel.push(`  = na lista final: ${streams.length} streams`);
         console.log('[painel] ' + painel.join('\n'));
+        guardar(ctx, painel.join('\n'));
         return json(url.searchParams.get('log') ? { painel, streams, log } : { streams });
       }
 
