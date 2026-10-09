@@ -606,6 +606,7 @@ async function addonsDaConta(authKey) {
   const lista = [];
   const ignorados = [];
   const metas = [];
+  const catalogos = [];
   let posSelf = -1;
   for (const [idx, a] of j.result.addons.entries()) {
     if (!a || !a.manifest || !/^https?:/i.test(a.transportUrl || '')) continue;
@@ -613,6 +614,10 @@ async function addonsDaConta(authKey) {
     if (ehSelf && posSelf < 0) posSelf = idx;
     const rm = ehSelf ? null : recursoMeta(a.manifest);
     const av = avaliarAddon(a.manifest);
+    if (!ehSelf) { // um catálogo de filmes sem filtro obrigatório, só para o /diagnostico?catalogos=1
+      const cat = (a.manifest.catalogs || []).find((c) => c && c.type === 'movie' && !(c.extra || []).some((e) => e && e.isRequired));
+      if (cat) catalogos.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), id: cat.id, nome: cat.name || cat.id });
+    }
     // fonte de meta: só quem NÃO é fonte de vídeos (addon com meta + stream, como o BestCine, não entra)
     if (av.ignorar && rm) metas.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rm.types, prefixes: rm.prefixes, idx });
     if (av.ignorar) { ignorados.push(`${a.manifest.name || hostDe(a.transportUrl)} (${av.ignorar})`); continue; } // fora: o próprio verificador, controle de impróprios e quem não tem stream
@@ -620,6 +625,7 @@ async function addonsDaConta(authKey) {
     lista.push({ n: a.manifest.name || hostDe(a.transportUrl), u: limparUrl(a.transportUrl), types: rec.types, prefixes: rec.prefixes });
   }
   lista.ignorados = ignorados;
+  lista.catalogos = catalogos;
   lista.metas = posSelf >= 0 ? metas.filter((m) => m.idx > posSelf) : metas; // só os que ficam abaixo deste addon na ordem
   if (cacheContas.size >= 200) cacheContas.clear();
   cacheContas.set(authKey, { t: Date.now(), lista });
@@ -1061,6 +1067,24 @@ export default {
         }
         const o = await listaDeOrigens(cfgB64, url.hostname, null, null);
         const mf = await fontesDeMeta(cfgB64, url.hostname, 'movie', 'tt0000001');
+        // /diagnostico?catalogos=1: pega um catálogo de filmes de cada addon e mostra se os filmes já vêm com defaultVideoId
+        let testeCatalogos;
+        if (url.searchParams.get('catalogos')) {
+          const cfgCat = lerConfigConta(cfgB64);
+          if (cfgCat && cfgCat.k) {
+            const daCat = await addonsDaConta(cfgCat.k);
+            testeCatalogos = await Promise.all((daCat.catalogos || []).slice(0, 10).map(async (c) => {
+              try {
+                const r = await fetch(`${c.u}/catalog/movie/${encodeURIComponent(c.id)}.json`, { headers: { 'User-Agent': UA, Accept: 'application/json' }, signal: AbortSignal.timeout(8000) });
+                if (!r.ok) return { addon: c.n, catalogo: c.nome, status: r.status };
+                const jc = await r.json();
+                const ms = Array.isArray(jc.metas) ? jc.metas : [];
+                const dv = (m) => (m && m.behaviorHints && m.behaviorHints.defaultVideoId) || null;
+                return { addon: c.n, catalogo: c.nome, itens: ms.length, com_defaultVideoId: ms.filter((m) => dv(m)).length, exemplo: ms.slice(0, 3).map((m) => ({ id: m && m.id, defaultVideoId: dv(m) })) };
+              } catch (e) { return { addon: c.n, catalogo: c.nome, erro: String((e && e.message) || e) }; }
+            }));
+          } else testeCatalogos = 'link sem conta do Stremio';
+        }
         // /diagnostico?testar=tt5537002 (&tipo=series): pede o meta a cada fonte e mostra o que ela responde
         let testeMeta;
         const idT = url.searchParams.get('testar') || '';
@@ -1085,7 +1109,7 @@ export default {
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
-          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, ligacao_controle: CONTROLE_BIND ? 'ativa (ligação de serviço)' : 'não usada (chamando pelo endereço normal)', erro_meta: mf.erro, id_filme: MODO_FILME,
+          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, teste_catalogos: testeCatalogos, ligacao_controle: CONTROLE_BIND ? 'ativa (ligação de serviço)' : 'não usada (chamando pelo endereço normal)', erro_meta: mf.erro, id_filme: MODO_FILME,
         });
       }
 
