@@ -7,4 +7,4 @@ vejam o que não e para ver ex: você abre o filme x e mostra filme y
 com esse ADD-ON o filme y que vem nomeado x nem aparece e bloqueado
 
 
-coloque em 1 ou 2 posição no topo 
+coloque antes dos buscadores
