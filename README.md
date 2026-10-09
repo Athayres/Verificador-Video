@@ -5,3 +5,6 @@ um vídeo se e o mesmo mostrado no catalogo devido a complexidade do stremio nã
 100% mas eu diria uns 90% melhor que nada evita que crianças
 vejam o que não e para ver ex: você abre o filme x e mostra filme y 
 com esse ADD-ON o filme y que vem nomeado x nem aparece e bloqueado
+
+
+coloque em 1 ou 2 posição no topo 
