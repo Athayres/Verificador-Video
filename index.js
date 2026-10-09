@@ -825,7 +825,7 @@ async function metaDe(base, tipo, id, cabecalhos, ponte) {
     const r = ponte ? await ponte.fetch(alvo, { headers: cabecalhos }) : await fetch(alvo, { headers: cabecalhos, signal: AbortSignal.timeout(8000) });
     if (!r.ok) {
       const t = await r.text().catch(() => '');
-      const dica = /1042/.test(t) ? ' — código 1042: a Cloudflare não deixa um Worker chamar outro pelo workers.dev; crie a ligação de serviço CONTROLE' : '';
+      const dica = /1042/.test(t) ? ' — código 1042: a Cloudflare não deixou um Worker chamar o outro; confira a opção global_fetch_strictly_public no wrangler.toml dos dois (ou crie a ligação de serviço CONTROLE)' : '';
       return { erro: `HTTP ${r.status}${dica}`, ms: Date.now() - t0 };
     }
     const j = await r.json();
@@ -1085,7 +1085,7 @@ export default {
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
-          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, ligacao_controle: CONTROLE_BIND ? 'ativa' : 'não criada (ligação de serviço CONTROLE)', erro_meta: mf.erro, id_filme: MODO_FILME,
+          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, ligacao_controle: CONTROLE_BIND ? 'ativa (ligação de serviço)' : 'não usada (chamando pelo endereço normal)', erro_meta: mf.erro, id_filme: MODO_FILME,
         });
       }
 

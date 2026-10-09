@@ -1,6 +1,8 @@
 name = "verificador-videos"
 main = "index.js"
 compatibility_date = "2026-01-01"
+# Deixa este Worker chamar o outro pelo endereço normal (workers.dev), sem ligação interna: evita o erro 1042 e o ciclo.
+compatibility_flags = ["global_fetch_strictly_public"]
 
 # Mantém no deploy as variáveis/secrets cadastrados no painel
 keep_vars = true
@@ -13,9 +15,3 @@ enabled = true
 [[kv_namespaces]]
 binding = "KV"
 id = "1cd06a5363d1444fa7bcf08be3926a6f"
-
-# Ligação interna com o Worker do Controle de Impróprios (a Cloudflare bloqueia Worker chamando Worker pelo workers.dev: erro 1042).
-# "service" é o nome do Worker do Controle (o que aparece no endereço dele: controle-de-improprio.<sua-conta>.workers.dev).
- [[services]]
- binding = "CONTROLE"
- service = "controle-de-improprio"
