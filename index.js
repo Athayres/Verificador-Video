@@ -791,7 +791,7 @@ async function motivoDaFalha(r) {
 async function streamsDe(base, tipo, id, nome, falhas, estat) {
   const t0 = Date.now();
   try {
-    const r = await fetch(`${base}/stream/${tipo}/${encodeURIComponent(id)}.json`, {
+    const r = await fetch(`${base}/stream/${tipo}/${id}.json`, {
       headers: { 'User-Agent': UA, Accept: 'application/json' },
       signal: AbortSignal.timeout(15000),
     });
@@ -841,7 +841,7 @@ async function fontesDeMeta(cfgB64, host, tipo, id) {
 async function metaDe(base, tipo, id, cabecalhos, ponte) {
   const t0 = Date.now();
   try {
-    const alvo = `${base}/meta/${tipo}/${encodeURIComponent(id)}.json`;
+    const alvo = `${base}/meta/${tipo}/${id}.json`;
     const r = ponte ? await ponte.fetch(alvo, { headers: cabecalhos }) : await fetch(alvo, { headers: cabecalhos, signal: AbortSignal.timeout(8000) });
     if (!r.ok) {
       const t = await r.text().catch(() => '');
@@ -1103,7 +1103,7 @@ export default {
         let testeMeta;
         const idT = url.searchParams.get('testar') || '';
         if (/^tt\d+$/.test(idT)) {
-          const tipoT = url.searchParams.get('testar_tipo') || url.searchParams.get('tipo') === 'series' ? 'series' : 'movie';
+          const tipoT = (url.searchParams.get('testar_tipo') || url.searchParams.get('tipo')) === 'series' ? 'series' : 'movie';
           const fontesT = await fontesDeMeta(cfgB64, url.hostname, tipoT, idT);
           testeMeta = await Promise.all(fontesT.lista.map(async (a) => {
             const t0 = Date.now();
@@ -1137,7 +1137,7 @@ export default {
         const cab = { 'User-Agent': ua, Accept: 'application/json', 'X-Via': 'autenticado' }; // repassa o aparelho (o Controle separa por IP/UA); X-Via evita que o Controle chame de volta
         const viaControle = /controle/i.test(request.headers.get('X-Via') || ''); // pedido vindo do Controle: não chama o Controle de volta
         if (ip) { cab['X-Forwarded-For'] = ip; cab['X-Real-IP'] = ip; }
-        const chaveC = `${cfgB64.slice(-16)}|${MODO_FILME}|${viaControle ? 'c' : ''}|${tipo}|${idTT}|${ip}|${ua}`;
+        const chaveC = `${await hashCurto(cfgB64 || 'sem-config')}|${MODO_FILME}|${viaControle ? 'c' : ''}|${tipo}|${idTT}|${ip}|${ua}`;
         const emC = cacheMeta.get(chaveC);
         if (emC && Date.now() - emC.t < 5 * 60 * 1000) return json({ meta: emC.meta });
         const painel = [`meta ${tipo} ${idPed}`];
@@ -1188,7 +1188,7 @@ export default {
         if (!['movie', 'series'].includes(tipo) || !/^tt\d+(:\d+:\d+)?$/.test(id)) return json({ streams: [] });
 
         // --- VERIFICAÇÃO DE CACHE DA LISTA COMPLETA DE STREAMS APROVADOS ---
-        const chaveCacheStreams = `${tipo}|${id}`;
+        const chaveCacheStreams = `${await hashCurto(cfgB64 || 'sem-config')}|${tipo}|${id}`;
         const listaCache = await cLerStream(chaveCacheStreams);
         if (listaCache) {
           console.log(`[cache] streams para ${id} servidos da cache de lista`);
@@ -1314,4 +1314,4 @@ export default {
   },
 };
 
-const LOGO_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAAABmJLR0QA/wD/AP+gvaeTAAAgAElEQVR4nO2dd4AcZd3HP8/Mtit7l2vpPUCAEEoSCBCEhKJSBUsgKAr6ClJUGH31FQsqIIqKyisIvDbEBiJCAkhHhNBSSEIgCSmXdSjxGAKp6QxXW5UOUk+gS4R7Gg189Y8v2h8pP8S9Yv8C8A+A2iC1C4JgD5G5M6V5YgJg0pA8U4gH88I8n5i11v2aO+s+Lq7e1x0+vM6w0B/7j6n8vM6w9kO8C8I1X0p/P2e25N5+zYx3C7s0D+bJb32fS39z9hQ47F7B0Z9uF562D5sE+bZ3u+N8h9G5OAX607Gv+B2y3a290Z+68E565259B4BzeHqU80M3bZz3d8t6+w/z8wU2N2+z/b4j9N7+H8o03G0A/y8P8A4v3n6c/5377f0G6W3E5N6H6/w8/D2M37y7Y3A8Cj18f4a3z5v3f+783+3O4j+7v+10mEa7YdM5gZt6u7g9n374b7H5bZ2c9r0947o7H0B2g9n34P474fQn224Hh37u7f34c/7f7eTfwK4O/8v+1832Pz9nf7t847n7b72D8f+8v+N7x94z4P39tq7v3z87D9oP9h2/b39z3b0n7v7w8b+v223x9+4n8H+5+z+2O+P24n49+X8X7/b+/79x+P7s7h282b+Hw83N592+388X233w988D4f49b/X4bA8APq48P+5733e8b8P2++72c+73v3P8f244585w6I72B289m5t7z+372332z7j9z99/7u/+2f/7f4P0f3531v8v44c/wH6L18e+fH2M729227A68D7+7f773j+7u7o35v3P7h9v3O4P0N24n49+H8o7H4b7E7/v233v2f36f33s7v7p8u80+g7v3O5+L+w/b4j9N4e4D7f7A7v7Y/7v292+znY77p3f48f3u2s7v73N8h7v7v7Y4n4//b7vv+9/7v7t72/49372Z3cPO79z972B28f3v48X3r+33z+/2vP99371v+D7+33x3b+P7a77w+4Xb3ufn/+79v8f2c3uP+37m389//2/v/a4b27u7n9v9n8Pv7ufv/uP2A64O/+wP79v8P25w/27v7f232Pffv78f3+/t9v4487s//+/v+/b4//+87v9v7v7u//78d3+/+7/d/b8v73v//f7O//7//f7ff7u7u7v7u7u7u7v7u7u7u7v7u7v7u7v7u7u7v7u7u7u7u7u7u7v7u7u7u7v7u7v7u7u7u7u7v7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7v7u7u7u7u7u7u7u7u7u7v7u7u7u7u7u7v7u7u7u7v7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7uقات
+const LOGO_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAD8klEQVR42u2dTW4UMRCFicUJEJHIeoi4BFdiDgNX4hIRYs0CiSvAaiRASf+W7feqvrdO1O16n8vV7mrP3dt373+/QmXVCAEAIABAAIAAAAEAAgAEAAgAEAAgAEAAgAAAAQACAAQACABQLr2uMtCfP77t/p/7h8f0cbnL2BJ2xOyqUKQBoKfpmWGwBmCG6dlgsARAyXh3EKwAUDbeFQQLAJyMdwNBGgBn411AkAUg2vwjBijcQ0kAIgLfI9iq95UGgLMBHhlcp3u1AOBoQBUC6XzvEgBk2ad3HEcjaLkKTasMsHfwTrtsLmObBsDMAC1de9R1VCBo6ubfPzzavmjZe+8zloOmbn4GKUPQMgQtGwRpAdhKd9ZWrK3jGpkFGubXhqBhfm0ImltQqAnMAMj0Tl/9kdk2A1Sb/UrjbrPprWr+nvH3zAJ8GlZcjdlfOws05UG7683XT/LxaLNmfxXz90AwI66N2d9/5m+FoMzr4IppPzITSANA+l+G4ywI0fEdngEyp/+t5i793ej4sARMqPiVloRQAKqm/yNm/vr4RSLOQzNAxvTfw/yRcWIJMJr5AIAAgNkvCsBaYZJp/R9h/lq8ogpBMkDRmQ8AmA8A1c0HAAQAzxVX/xdYWWd/WQBuX+0uVdo3CDKbTwYouu4DwIZn6Q/fP6c3nwxQ3PzyADifPgIAnUCoNPsBICD1P12u1o0woaeEOb8QOlLxP12u3cY4KpZkgEDzb8Y5ZYSG+XHmUwMg+aVuKgBqqfHoTl9vg21PCXMi/+w278yxRl675BIQtcf/3EaS28aS9FGxyuavgeASn3AAsj3r79nlGzH26GvwFFBc8sfFu8x+17h0AeBsmor+cjZLY0ePJWbaEvAS7dFn67iYP6s4bjNpXWu+PAtBJvN7FZgyReDS2TpHjKzQzycPQOQBiKqHLDnPfpkMEHG2Duu+KABr9O7twlkzN1vq7725NDUDHGnBWqoLnMxXeTPaZlJ8trHib8Mzmj9ia3noL4e+NPCjmeCMMH/CErCUCTK1WbmYL7UPELEkUPEbALBGd28I1M0f/Tpd9tfDe9QF6m/3ZvRSTANga4CiQMB8QQBGQTDS/CNr/cwuqulF4JbBuzwhuJkvkQF6Z4IRs/9oha/QPykDwJ5AbgWhp/lnH+tUmmelAIjMBj3Mj3iWV+ualgRgDwRPl+s/MLxULxwJfPTmjWLLvCwAPQxQL3YBICEI6p+KWQDgCILLN4JWADiA4PZxqCUAiiC4HjdnDcBsGDKcMZgGgFEwZDtYMiUAUVBUOEW0DADoeXE+AAAgAEAAgAAAAQACAAQACAAQACAAQACAAAABAAIABAAon/4A19kOzorX1MsAAAAASUVORK5CYII=';
