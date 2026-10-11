@@ -48,7 +48,7 @@ const MIN_KBPS = 100; // abaixo disso o arquivo é pequeno demais para a duraç�
 let TIMEOUT = 8000;
 let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
-let ATRASO_STREAM_MS = 3000; // dá tempo aos outros addons antes de este consultar as origens
+let ATRASO_STREAM_MS = 3000; // espera antes de consultar os addons de origem
 let OS_KEY = '';
 let MODO = 'ocultar'; // ocultar | marcar | bloquear
 let MODO_FILME = 'trocar'; // trocar | dica
@@ -1205,8 +1205,6 @@ export default {
         const falhas = [];
         const estat = new Map();
         const tally = new Map(); // por addon: aprovados, reprovados (e por quê), sem medir
-        // Atraso de cortesia: dá aos outros addons tempo para responder antes de começar as consultas desta lista.
-        // O Worker não recebe o estado interno da interface do Stremio; isto é uma espera, não uma confirmação de carregamento.
         if (ATRASO_STREAM_MS > 0 && origens.lista.length > 0) {
           console.log(`[stream] aguardando ${ATRASO_STREAM_MS} ms antes de consultar os addons de origem`);
           await new Promise((resolve) => setTimeout(resolve, ATRASO_STREAM_MS));
