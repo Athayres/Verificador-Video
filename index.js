@@ -30,6 +30,8 @@
  *   Render (ex.: https://marca-dagua.onrender.com) e o mesmo segredo (MARCA_SEGREDO) que foi definido lá. Ao tocar (/play), o Worker pergunta
  *   ao serviço; se ele achar uma marca fixa, o vídeo é bloqueado e some das próximas listas. Se o serviço demorar ou falhar, o vídeo TOCA
  *   normalmente (nunca trava por causa disso) e a análise termina em segundo plano para valer da próxima vez.
+ *   O mesmo serviço também lê o ARQUIVO com o ffmpeg (/info) quando o Worker não consegue ler o cabeçalho (TS, AVI, MP4 com o índice
+ *   no fim): a duração e o bitrate lidos por ele passam a valer nos testes (inclusive para contar como "autenticado").
  *   MARCA_DAGUA (opcional): 0 desliga mesmo com MARCA_URL.   MARCA_ESPERA_MS (padrão 8000; 2000–25000): quanto o clique espera o serviço.
  *   SO_AUTENTICADOS (opcional): 1 (padrão) = só passa para o Stremio o vídeo que foi CONFIRMADO (duração do arquivo bate com o TMDB,
  *   ou reconhecido pelo OpenSubtitles/hash); o que não deu para medir também é removido. 0 = o que não deu para medir continua aparecendo.
@@ -139,7 +141,7 @@ async function lerToken(tok) {
 }
 
 // ---------- caches (memória do Worker + KV, se ligado) ----------
-const mem = { runtime: new Map(), vered: new Map(), os: new Map(), streams: new Map(), marca: new Map() };
+const mem = { runtime: new Map(), vered: new Map(), os: new Map(), streams: new Map(), marca: new Map(), info: new Map() };
 async function hashCurto(s) {
   const h = new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(s)));
   return Array.from(h.subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -559,15 +561,19 @@ async function veredito({ u, i, t }, rtConhecido) {
   let r;
   try {
     const [info, arq] = await Promise.all([infoTMDB(i, t).catch(() => null), duracaoArquivo(u)]);
+    // o Worker não leu o cabeçalho (ex.: TS, AVI, MP4 com o índice no fim): o ffmpeg do serviço de marca d'água tenta
+    const ff = !(arq && arq.min) && marcaAtiva() ? await infoRemota(u, MARCA_ESPERA_MS) : null;
     const rt = info ? info.min : (rtConhecido || null);
-    const dur = arq && arq.min;
+    const dur = (arq && arq.min) || (ff && ff.duracaoMin) || null;
     const tit = t === 'movie' && arq ? checarTituloGravado(arq.titulo, info) : null;
     const baseMin = dur || rt; // sem a duração do arquivo, estima pela do TMDB
-    const kbps = baseMin && arq && arq.total ? (arq.total * 8) / (baseMin * 60) / 1000 : null;
+    const kbpsArq = baseMin && arq && arq.total ? (arq.total * 8) / (baseMin * 60) / 1000 : null;
+    const kbps = kbpsArq !== null ? kbpsArq : (ff && ff.bitrateKbps > 0 ? ff.bitrateKbps : null); // sem o tamanho do arquivo, usa o bitrate que o ffmpeg leu
     if (tit) {
       r = { status: 'errado', por: 'título gravado no arquivo', texto: tit };
     } else if (MIN_KBPS > 0 && kbps !== null && baseMin > 20 && kbps < MIN_KBPS) {
-      r = { status: 'errado', por: 'bitrate baixo', texto: `só ${Math.round(arq.total / 1048576)} MB para ${Math.round(baseMin)} min (cerca de ${Math.round(kbps)} kbps, mínimo ${MIN_KBPS}): qualidade muito baixa ou arquivo falso` };
+      const txtKb = arq && arq.total ? `só ${Math.round(arq.total / 1048576)} MB para ${Math.round(baseMin)} min (cerca de ${Math.round(kbps)} kbps, mínimo ${MIN_KBPS})` : `bitrate médio de cerca de ${Math.round(kbps)} kbps (mínimo ${MIN_KBPS})`;
+      r = { status: 'errado', por: 'bitrate baixo', texto: `${txtKb}: qualidade muito baixa ou arquivo falso` };
     } else if (rt && dur) {
       const folga = Math.max(rt * (t === 'series' ? TOL * 1.5 : TOL), TOL_MIN);
       if (Math.abs(dur - rt) > folga) {
@@ -1104,6 +1110,22 @@ async function marcaRemota(u, durMin, esperaMs) {
     return { status: 'indeterminado', texto: 'o serviço de marca d\'água não respondeu a tempo' };
   }
 }
+// Pede ao serviço que leia o arquivo com o ffmpeg (duração e bitrate). Devolve null em qualquer falha (aí o vídeo fica "não medido", como antes).
+async function infoRemota(u, esperaMs) {
+  const c = await cLer('info', `info|${u}`);
+  if (c) return c;
+  try {
+    const r = await fetch(`${MARCA_URL}/info?u=${encodeURIComponent(u)}`, { headers: { 'X-Segredo': MARCA_SEGREDO }, signal: AbortSignal.timeout(esperaMs) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j && j.ok && j.duracaoMin > 0) {
+      const guardar = { duracaoMin: j.duracaoMin, bitrateKbps: j.bitrateKbps || null, video: j.video || null, audio: j.audio || [] };
+      await cGravar('info', `info|${u}`, guardar);
+      return guardar;
+    }
+    return null;
+  } catch { return null; }
+}
 // O Render gratuito dorme: ao abrir uma lista de streams, acorda o serviço em segundo plano (no máx. 1 vez a cada 8 min).
 function aquecerMarca(ctx) {
   if (!marcaAtiva() || Date.now() - marcaAquecidoEm < 8 * 60 * 1000) return;
@@ -1302,7 +1324,7 @@ export default {
             else if (!rt) situacao = 'TMDB sem duração';
             else if (!v) situacao = 'duração não medida (tempo ou limite de links)';
             else if (v.status === 'nao_verificado') situacao = 'não deu para ler a duração do arquivo';
-            else situacao = `${v.status.toUpperCase()} (${v.texto || `arquivo ${v.arquivoMin} min, TMDB${v.tmdbMin} min`})`;
+            else situacao = `${v.status.toUpperCase()} (${v.texto || `arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min`})`;
             let marca = null;
             let autenticado = !!(v && v.status === 'ok');
             if (naoLancado) {
@@ -1384,7 +1406,7 @@ export default {
         const dados = await lerToken(partes[1]);
         if (!dados || !/^https?:\/\//i.test(dados.u || '')) return texto(403, 'Link inválido');
         const v = await veredito(dados);
-        console.log(`play ${dados.i} -> ${v.status}${v.texto ? ` (${v.texto})` : v.arquivoMin ? ` (arquivo ${v.arquivoMin} min, TMDB${v.tmdbMin} min)` : ''}`);
+        console.log(`play ${dados.i} -> ${v.status}${v.texto ? ` (${v.texto})` : v.arquivoMin ? ` (arquivo ${v.arquivoMin} min, TMDB ${v.tmdbMin} min)` : ''}`);
         let mw = null;
         if (v.status !== 'errado' && marcaAtiva()) {
           const dm = v.arquivoMin || v.tmdbMin;
@@ -1395,7 +1417,7 @@ export default {
         if (url.searchParams.get('debug')) return json(Object.assign({}, v, { marca: mw }));
         if (mw && mw.status === 'marca') return texto(404, `Vídeo com ${mw.texto}.`);
         if (v.status === 'errado') {
-          return texto(404, `Vídeo incorreto: ${v.texto || `o arquivo tem ${v.arquivoMin} min e o filme deveria ter cerca de${v.tmdbMin} min`}.`);
+          return texto(404, `Vídeo incorreto: ${v.texto || `o arquivo tem ${v.arquivoMin} min e o filme deveria ter cerca de ${v.tmdbMin} min`}.`);
         }
         return new Response(null, { status: 302, headers: { Location: dados.u, 'Cache-Control': 'no-store' } });
       }
