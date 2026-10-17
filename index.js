@@ -25,7 +25,7 @@
  *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
  *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  *   ATRASO_STREAM_MS (padrão 3000 ms; espera antes de consultar os streams de origem; intervalo 0–10000)
- *   ID_FILME (opcional): trocar (padrão: troca o id e o defaultVideoId do filme) | dica (só o defaultVideoId)
+ *   ID_FILME (opcional): dica (padrão: só o defaultVideoId; o id do filme na biblioteca não muda) | trocar (troca também o id do filme)
  *   CONTROLE (opcional, ligação de serviço): liga este Worker ao Worker do Controle de Impróprios. A Cloudflare não deixa um
  *   Worker chamar outro pelo endereço workers.dev (erro 1042); com a ligação o meta do Controle é lido por dentro.
  */
@@ -51,7 +51,7 @@ let MAX_SONDAS = 12;
 let ATRASO_STREAM_MS = 3000; // espera antes de consultar os addons de origem
 let OS_KEY = '';
 let MODO = 'ocultar'; // ocultar | marcar | bloquear
-let MODO_FILME = 'trocar'; // trocar | dica
+let MODO_FILME = 'dica'; // dica (padrão) | trocar
 let CONTROLE_BIND = null; // ligação de serviço com o Controle de Impróprios (opcional)
 
 async function carregarConfig(env) {
@@ -75,7 +75,7 @@ async function carregarConfig(env) {
   OS_KEY = await ler('OPENSUBTITLES_KEY');
   const modo = String((await ler('INCORRETOS')) || '').toLowerCase();
   MODO = ['ocultar', 'marcar', 'bloquear'].includes(modo) ? modo : (String(env.BLOQUEAR_INCORRETOS || '') === '0' ? 'marcar' : 'ocultar');
-  MODO_FILME = String((await ler('ID_FILME')) || '').toLowerCase() === 'dica' ? 'dica' : 'trocar';
+  MODO_FILME = String((await ler('ID_FILME')) || '').toLowerCase() === 'trocar' ? 'trocar' : 'dica';
   CONTROLE_BIND = env.CONTROLE && typeof env.CONTROLE.fetch === 'function' ? env.CONTROLE : null;
 }
 
