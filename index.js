@@ -25,6 +25,7 @@
  *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
  *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  *   ATRASO_STREAM_MS (padrão 3000 ms; espera antes de consultar os streams de origem; intervalo 0–10000)
+ *   BITRATE_MIN (opcional, kbps, padrão 400): remove o vídeo cujo bitrate médio (tamanho do arquivo ÷ duração) fica abaixo disso. 0 = desliga.
  *   SO_AUTENTICADOS (opcional): 1 (padrão) = só passa para o Stremio o vídeo que foi CONFIRMADO (duração do arquivo bate com o TMDB,
  *   ou reconhecido pelo OpenSubtitles/hash); o que não deu para medir também é removido. 0 = o que não deu para medir continua aparecendo.
  *   ID_FILME (opcional): dica (padrão: só o defaultVideoId; o id do filme na biblioteca não muda) | trocar (troca também o id do filme)
@@ -46,7 +47,7 @@ let SECRET = '';
 let KV = null;
 let TOL = 0.20;
 let TOL_MIN = 10;
-const MIN_KBPS = 100; // abaixo disso o arquivo é pequeno demais para a duração (trailer/placeholder)
+let MIN_KBPS = 400; // bitrate médio mínimo (kbps): abaixo disso o vídeo é removido (qualidade muito baixa ou arquivo falso)
 let TIMEOUT = 8000;
 let ORCAMENTO_MS = 8000;
 let MAX_SONDAS = 12;
@@ -80,6 +81,8 @@ async function carregarConfig(env) {
   MODO = ['ocultar', 'marcar', 'bloquear'].includes(modo) ? modo : (String(env.BLOQUEAR_INCORRETOS || '') === '0' ? 'marcar' : 'ocultar');
   MODO_FILME = String((await ler('ID_FILME')) || '').toLowerCase() === 'trocar' ? 'trocar' : 'dica';
   SO_AUTENTICADOS = !['0', 'false', 'nao', 'não', 'off'].includes(String((await ler('SO_AUTENTICADOS')) || '1').trim().toLowerCase());
+  const bm = await ler('BITRATE_MIN');
+  MIN_KBPS = bm === '' ? 400 : (Number.isFinite(Number(bm)) ? Math.max(0, Number(bm)) : 400);
   CONTROLE_BIND = env.CONTROLE && typeof env.CONTROLE.fetch === 'function' ? env.CONTROLE : null;
 }
 
@@ -543,11 +546,12 @@ async function veredito({ u, i, t }, rtConhecido) {
     const rt = info ? info.min : (rtConhecido || null);
     const dur = arq && arq.min;
     const tit = t === 'movie' && arq ? checarTituloGravado(arq.titulo, info) : null;
-    const kbps = dur && arq.total ? (arq.total * 8) / (dur * 60) / 1000 : null;
+    const baseMin = dur || rt; // sem a duração do arquivo, estima pela do TMDB
+    const kbps = baseMin && arq && arq.total ? (arq.total * 8) / (baseMin * 60) / 1000 : null;
     if (tit) {
       r = { status: 'errado', por: 'título gravado no arquivo', texto: tit };
-    } else if (kbps !== null && dur > 20 && kbps < MIN_KBPS) {
-      r = { status: 'errado', por: 'tamanho do arquivo', texto: `só ${Math.round(arq.total / 1048576)} MB para ${Math.round(dur)} min: pequeno demais, provavelmente não é o filme` };
+    } else if (MIN_KBPS > 0 && kbps !== null && baseMin > 20 && kbps < MIN_KBPS) {
+      r = { status: 'errado', por: 'bitrate baixo', texto: `só ${Math.round(arq.total / 1048576)} MB para ${Math.round(baseMin)} min (cerca de ${Math.round(kbps)} kbps, mínimo ${MIN_KBPS}): qualidade muito baixa ou arquivo falso` };
     } else if (rt && dur) {
       const folga = Math.max(rt * (t === 'series' ? TOL * 1.5 : TOL), TOL_MIN);
       if (Math.abs(dur - rt) > folga) {
@@ -1262,7 +1266,11 @@ export default {
             } else if (v && v.status === 'errado') marca = v.por ? { por: v.por, texto: v.texto } : { por: 'duração', texto: `o arquivo tem ${v.arquivoMin} min e o filme tem ${v.tmdbMin} min` };
             else if (!v || v.status === 'nao_verificado') { // duração indisponível
               const bh = it.s.behaviorHints || {};
-              if (!ehDireto(it.s) && bh.videoHash && bh.videoSize) { // torrent/addon que informa o hash: pergunta ao site externo
+              if (!ehDireto(it.s) && MIN_KBPS > 0 && rt > 20 && Number(bh.videoSize) > 0) { // torrent: tamanho informado ÷ duração do TMDB
+                const kb = (Number(bh.videoSize) * 8) / (rt * 60) / 1000;
+                if (kb < MIN_KBPS) { marca = { por: 'bitrate baixo', texto: `só ${Math.round(Number(bh.videoSize) / 1048576)} MB para ${rt} min (cerca de ${Math.round(kb)} kbps, mínimo ${MIN_KBPS})` }; situacao = `ERRADO (bitrate baixo: ${Math.round(kb)} kbps)`; }
+              }
+              if (!marca && !ehDireto(it.s) && bh.videoHash && bh.videoSize) { // torrent/addon que informa o hash: pergunta ao site externo
                 const ext = await autenticidadePorHash(String(bh.videoHash), Number(bh.videoSize), id).catch(() => null);
                 if (ext && ext.status === 'errado') { marca = { por: ext.por, texto: ext.texto }; situacao = `ERRADO (${ext.texto})`; }
                 else if (ext && ext.status === 'ok') { situacao = `OK (${ext.texto})`; autenticado = true; }
