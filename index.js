@@ -25,6 +25,8 @@
  *   INCORRETOS (opcional): ocultar (padrão, remove da lista) | marcar (só renomeia) | bloquear (aparece, mas não toca)
  *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  *   ATRASO_STREAM_MS (padrão 3000 ms; espera antes de consultar os streams de origem; intervalo 0–10000)
+ *   SO_AUTENTICADOS (opcional): 1 (padrão) = só passa para o Stremio o vídeo que foi CONFIRMADO (duração do arquivo bate com o TMDB,
+ *   ou reconhecido pelo OpenSubtitles/hash); o que não deu para medir também é removido. 0 = o que não deu para medir continua aparecendo.
  *   ID_FILME (opcional): dica (padrão: só o defaultVideoId; o id do filme na biblioteca não muda) | trocar (troca também o id do filme)
  *   CONTROLE (opcional, ligação de serviço): liga este Worker ao Worker do Controle de Impróprios. A Cloudflare não deixa um
  *   Worker chamar outro pelo endereço workers.dev (erro 1042); com a ligação o meta do Controle é lido por dentro.
@@ -52,6 +54,7 @@ let ATRASO_STREAM_MS = 3000; // espera antes de consultar os addons de origem
 let OS_KEY = '';
 let MODO = 'ocultar'; // ocultar | marcar | bloquear
 let MODO_FILME = 'dica'; // dica (padrão) | trocar
+let SO_AUTENTICADOS = true; // só passa o que foi confirmado de verdade
 let CONTROLE_BIND = null; // ligação de serviço com o Controle de Impróprios (opcional)
 
 async function carregarConfig(env) {
@@ -76,6 +79,7 @@ async function carregarConfig(env) {
   const modo = String((await ler('INCORRETOS')) || '').toLowerCase();
   MODO = ['ocultar', 'marcar', 'bloquear'].includes(modo) ? modo : (String(env.BLOQUEAR_INCORRETOS || '') === '0' ? 'marcar' : 'ocultar');
   MODO_FILME = String((await ler('ID_FILME')) || '').toLowerCase() === 'trocar' ? 'trocar' : 'dica';
+  SO_AUTENTICADOS = !['0', 'false', 'nao', 'não', 'off'].includes(String((await ler('SO_AUTENTICADOS')) || '1').trim().toLowerCase());
   CONTROLE_BIND = env.CONTROLE && typeof env.CONTROLE.fetch === 'function' ? env.CONTROLE : null;
 }
 
@@ -1269,6 +1273,11 @@ export default {
             }
             log.push(`[${it.origem}] ${nome} -> ${situacao}`);
             const T = tally.get(it.origem) || (tally.set(it.origem, { ok: 0, reprov: 0, semMedir: 0, motivos: {} }), tally.get(it.origem));
+            if (!marca && SO_AUTENTICADOS && !autenticado) {
+              T.semMedir++;
+              log.push(`[${it.origem}] ${nome} -> REMOVIDO (não confirmado: ${situacao})`);
+              return null; // só fica na lista o que foi autenticado de verdade
+            }
             if (!marca) { if (v && v.status === 'ok') T.ok++; else T.semMedir++; }
             else { T.reprov++; const mo = marca.por || marca.rotulo || 'outro'; T.motivos[mo] = (T.motivos[mo] || 0) + 1; }
             if (marca) {
