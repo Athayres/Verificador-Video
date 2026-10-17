@@ -26,6 +26,11 @@
  *   TOLERANCIA (padrão 0.20; séries ×1.5)   TOLERANCIA_MIN (padrão 10)   FFPROBE_TIMEOUT (padrão 8000 ms; vale para a leitura)
  *   ATRASO_STREAM_MS (padrão 3000 ms; espera antes de consultar os streams de origem; intervalo 0–10000)
  *   BITRATE_MIN (opcional, kbps, padrão 400): remove o vídeo cujo bitrate médio (tamanho do arquivo ÷ duração) fica abaixo disso. 0 = desliga.
+ *   MARCA_URL + MARCA_SEGREDO (opcionais, as duas juntas): ligam a detecção de marca d'água. É o endereço do serviço "marca-dagua" no
+ *   Render (ex.: https://marca-dagua.onrender.com) e o mesmo segredo (MARCA_SEGREDO) que foi definido lá. Ao tocar (/play), o Worker pergunta
+ *   ao serviço; se ele achar uma marca fixa, o vídeo é bloqueado e some das próximas listas. Se o serviço demorar ou falhar, o vídeo TOCA
+ *   normalmente (nunca trava por causa disso) e a análise termina em segundo plano para valer da próxima vez.
+ *   MARCA_DAGUA (opcional): 0 desliga mesmo com MARCA_URL.   MARCA_ESPERA_MS (padrão 8000; 2000–25000): quanto o clique espera o serviço.
  *   SO_AUTENTICADOS (opcional): 1 (padrão) = só passa para o Stremio o vídeo que foi CONFIRMADO (duração do arquivo bate com o TMDB,
  *   ou reconhecido pelo OpenSubtitles/hash); o que não deu para medir também é removido. 0 = o que não deu para medir continua aparecendo.
  *   ID_FILME (opcional): dica (padrão: só o defaultVideoId; o id do filme na biblioteca não muda) | trocar (troca também o id do filme)
@@ -56,6 +61,11 @@ let OS_KEY = '';
 let MODO = 'ocultar'; // ocultar | marcar | bloquear
 let MODO_FILME = 'dica'; // dica (padrão) | trocar
 let SO_AUTENTICADOS = true; // só passa o que foi confirmado de verdade
+let MARCA_URL = ''; // serviço de marca d'água (Render)
+let MARCA_SEGREDO = '';
+let MARCA_ON = true;
+let MARCA_ESPERA_MS = 8000;
+let marcaAquecidoEm = 0;
 let CONTROLE_BIND = null; // ligação de serviço com o Controle de Impróprios (opcional)
 
 async function carregarConfig(env) {
@@ -83,6 +93,12 @@ async function carregarConfig(env) {
   SO_AUTENTICADOS = !['0', 'false', 'nao', 'não', 'off'].includes(String((await ler('SO_AUTENTICADOS')) || '1').trim().toLowerCase());
   const bm = await ler('BITRATE_MIN');
   MIN_KBPS = bm === '' ? 400 : (Number.isFinite(Number(bm)) ? Math.max(0, Number(bm)) : 400);
+  MARCA_URL = String(await ler('MARCA_URL')).replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(MARCA_URL)) MARCA_URL = '';
+  MARCA_SEGREDO = await ler('MARCA_SEGREDO');
+  MARCA_ON = !['0', 'false', 'nao', 'não', 'off'].includes(String((await ler('MARCA_DAGUA')) || '1').trim().toLowerCase());
+  const me = Number(await ler('MARCA_ESPERA_MS'));
+  MARCA_ESPERA_MS = Number.isFinite(me) && me >= 2000 ? Math.min(25000, me) : 8000;
   CONTROLE_BIND = env.CONTROLE && typeof env.CONTROLE.fetch === 'function' ? env.CONTROLE : null;
 }
 
@@ -123,7 +139,7 @@ async function lerToken(tok) {
 }
 
 // ---------- caches (memória do Worker + KV, se ligado) ----------
-const mem = { runtime: new Map(), vered: new Map(), os: new Map(), streams: new Map() };
+const mem = { runtime: new Map(), vered: new Map(), os: new Map(), streams: new Map(), marca: new Map() };
 async function hashCurto(s) {
   const h = new Uint8Array(await crypto.subtle.digest('SHA-256', te.encode(s)));
   return Array.from(h.subarray(0, 16), (b) => b.toString(16).padStart(2, '0')).join('');
@@ -1068,6 +1084,34 @@ async function entrar(){
   return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
+
+// ---------- marca d'água (o trabalho pesado é feito pelo serviço "marca-dagua" no Render) ----------
+const marcaAtiva = () => !!(MARCA_ON && MARCA_URL && MARCA_SEGREDO);
+// Pergunta ao serviço. Nunca lança erro: em qualquer falha devolve { status: 'indeterminado' } (o vídeo toca).
+async function marcaRemota(u, durMin, esperaMs) {
+  try {
+    const q = `${MARCA_URL}/analisar?u=${encodeURIComponent(u)}${durMin > 0 ? `&min=${durMin}` : ''}`;
+    const r = await fetch(q, { headers: { 'X-Segredo': MARCA_SEGREDO }, signal: AbortSignal.timeout(esperaMs) });
+    if (!r.ok) return { status: 'indeterminado', texto: `o serviço respondeu ${r.status}` };
+    const j = await r.json();
+    if (j && (j.status === 'marca' || j.status === 'limpo')) {
+      const guardar = { status: j.status, regiao: j.regiao, score: j.score, texto: j.texto };
+      await cGravar('marca', `marca|${u}`, guardar);
+      return guardar;
+    }
+    return { status: 'indeterminado', texto: (j && j.texto) || 'sem resposta útil' };
+  } catch {
+    return { status: 'indeterminado', texto: 'o serviço de marca d\'água não respondeu a tempo' };
+  }
+}
+// O Render gratuito dorme: ao abrir uma lista de streams, acorda o serviço em segundo plano (no máx. 1 vez a cada 8 min).
+function aquecerMarca(ctx) {
+  if (!marcaAtiva() || Date.now() - marcaAquecidoEm < 8 * 60 * 1000) return;
+  marcaAquecidoEm = Date.now();
+  const p = fetch(`${MARCA_URL}/health`, { signal: AbortSignal.timeout(25000) }).catch(() => {});
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -1082,6 +1126,7 @@ export default {
       const RESERVADOS = ['configure', 'manifest.json', 'meta', 'stream', 'play', 'health', 'diagnostico', 'ultimos', 'check_tempo.png'];
       const cfgB64 = RESERVADOS.includes(partes[0]) ? '' : partes.shift(); // /<config>/manifest.json, /<config>/stream/...
       if (['manifest.json', 'meta', 'stream'].includes(partes[0])) gravarMeuLink(ctx, url, cfgB64);
+      if (partes[0] === 'stream' && marcaAtiva()) aquecerMarca(ctx);
       if (partes[0] === 'health') return json({ ok: true });
       if (partes[0] === 'configure') return paginaConfig();
       if (partes[0] === 'manifest.json') return json(manifest(base));
@@ -1147,7 +1192,7 @@ export default {
           opensubtitles: OS_KEY ? 'com chave' : 'sem chave (endereço antigo)',
           reprovados: MODO === 'ocultar' ? 'removidos da lista' : MODO === 'bloquear' ? 'aparecem bloqueados (não tocam)' : 'aparecem marcados (continuam tocando)',
           link_com_conta: o.temConta, erro_conta: o.erro, addons_com_stream: o.lista.map((a) => a.n),
-          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, teste_catalogos: testeCatalogos, ligacao_controle: CONTROLE_BIND ? 'ativa (ligação de serviço)' : 'não usada (chamando pelo endereço normal)', erro_meta: mf.erro, id_filme: MODO_FILME,
+          prefixos_dos_addons_de_stream: o.lista.map((a) => `${a.n}: ${a.prefixes.length ? a.prefixes.join(', ') : 'SEM idPrefixes (o Stremio pede qualquer id a ele, inclusive vrf:)'}`), fora_da_lista: o.ignorados, fontes_de_meta: mf.lista.map((a) => a.n), teste_meta: testeMeta, teste_catalogos: testeCatalogos, ligacao_controle: CONTROLE_BIND ? 'ativa (ligação de serviço)' : 'não usada (chamando pelo endereço normal)', erro_meta: mf.erro, id_filme: MODO_FILME, marca_dagua: marcaAtiva() ? 'ligada (' + MARCA_URL + ')' : (MARCA_URL ? 'desligada: falta MARCA_SEGREDO ou MARCA_DAGUA=0' : 'não configurada (sem MARCA_URL)'),
         });
       }
 
@@ -1279,6 +1324,10 @@ export default {
               if (motivo) { marca = { por: 'nome do arquivo', texto: motivo }; situacao = `ERRADO pelo nome: ${motivo}`; }
               else if (nomeDoArquivo(it.s)) situacao += ` | nome "${nomeDoArquivo(it.s).slice(0, 70)}" sem sinais de erro`;
             }
+            if (!marca && marcaAtiva() && ehDireto(it.s)) { // já analisado antes e com marca d'água: sai da lista
+              const mw = await cLer('marca', `marca|${it.s.url}`);
+              if (mw && mw.status === 'marca') { marca = { por: "marca d'água", texto: mw.texto }; situacao = `MARCA D'ÁGUA (${mw.texto})`; }
+            }
             log.push(`[${it.origem}] ${nome} -> ${situacao}`);
             const T = tally.get(it.origem) || (tally.set(it.origem, { ok: 0, reprov: 0, semMedir: 0, motivos: {} }), tally.get(it.origem));
             if (!marca && SO_AUTENTICADOS && !autenticado) {
@@ -1336,7 +1385,15 @@ export default {
         if (!dados || !/^https?:\/\//i.test(dados.u || '')) return texto(403, 'Link inválido');
         const v = await veredito(dados);
         console.log(`play ${dados.i} -> ${v.status}${v.texto ? ` (${v.texto})` : v.arquivoMin ? ` (arquivo ${v.arquivoMin} min, TMDB${v.tmdbMin} min)` : ''}`);
-        if (url.searchParams.get('debug')) return json(v);
+        let mw = null;
+        if (v.status !== 'errado' && marcaAtiva()) {
+          const dm = v.arquivoMin || v.tmdbMin;
+          mw = (await cLer('marca', `marca|${dados.u}`)) || (await marcaRemota(dados.u, dm, MARCA_ESPERA_MS));
+          // serviço dormindo/lento: este clique toca normalmente; a análise termina em segundo plano e vale da próxima vez
+          if (mw.status === 'indeterminado' && ctx && ctx.waitUntil) ctx.waitUntil(marcaRemota(dados.u, dm, 25000));
+        }
+        if (url.searchParams.get('debug')) return json(Object.assign({}, v, { marca: mw }));
+        if (mw && mw.status === 'marca') return texto(404, `Vídeo com ${mw.texto}.`);
         if (v.status === 'errado') {
           return texto(404, `Vídeo incorreto: ${v.texto || `o arquivo tem ${v.arquivoMin} min e o filme deveria ter cerca de${v.tmdbMin} min`}.`);
         }
