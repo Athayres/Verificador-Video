@@ -1,6 +1,6 @@
 Autor: Athayres Oliveira Miranda
 
-Servidor: Cloudflare
+Servidor: Render
 
 ADD-ON Stremio esse add-on foi criado para suprir a necessidade de autenticar
 um vídeo se e o mesmo mostrado no catalogo devido a complexidade do stremio não é
