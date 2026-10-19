@@ -1,0 +1,10 @@
+{
+  "name": "verificador-com-marca-dagua",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "servidor.js",
+  "scripts": { "start": "node servidor.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "ffmpeg-static": "^5.2.0" }
+}
